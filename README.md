@@ -7,7 +7,7 @@
 </div>
 
 <div align="center">
-<img width="800" alt="image" src="asserts/fig1.png">
+<img width="800" alt="image" src="assets/fig1.png">
 <p>DeepSight achieves leading performance on most of metrics compared with E2E methods.</p>
 </div>
 
@@ -19,7 +19,7 @@ However, the reasoning mechanisms employed in most methods are direct adaptation
 ## 🚀 Pipeline
 
 <div align="center">
-<img width="800" alt="image" src="asserts/figmethod.png">
+<img width="800" alt="image" src="assets/figmethod.png">
 <p>The pipeline of our method, a holistic training and inference framework for closed-loop driving. It consists of two main modules:
 (a) Long-term driving-world model, for aligning DINOv3 features extracted from future multi-frame RGB images in the BEV space
 during training. (b) An adaptive CoT module for integrating external knowledge to enhance reasoning and decision-making in long-tail
@@ -29,7 +29,7 @@ cases</p>
 ## 🖼️ Visualization
 
 <div align="center">
-<img width="800" alt="image" src="asserts/figvis.png">
+<img width="800" alt="image" src="assets/figvis.png">
 <p>Qualitative results of DeepSight on the Bench2Drive closed-loop evaluation set.</p>
 </div>
 
