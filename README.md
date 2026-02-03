@@ -5,11 +5,26 @@
 
 
 
+</div>
 
+<div align="center">
+<img width="600" alt="image" src="assets/fig1new.pdf">
+<p>DeepSight achieves leading performance on most of metrics compared with E2E methods.</p>
+</div>
 
 ## 📖 Abstract
 End-to-end autonomous driving systems are increasingly integrating Vision-Language Model (VLM) architectures, incorporating text reasoning or visual reasoning to enhance the robustness and accuracy of driving decisions.
 However, the reasoning mechanisms employed in most methods are direct adaptations from general domains, lacking in-depth exploration tailored to autonomous driving scenarios, particularly within visual reasoning modules. In this paper, we propose a driving world model that performs parallel prediction of latent semantic features for consecutive future frames in the bird’s-eye-view (BEV) space, thereby enabling long-horizon modeling of future world states. We also introduce an efficient and adaptive text reasoning mechanism that utilizes additional social knowledge and reasoning capabilities to further improve driving performance in challenging long-tail scenarios. We present a novel, efficient, and effective approach that achieves state-of-the-art (SOTA) results on the closed-loop Bench2drive benchmark.
+
+## 🚀 Pipeline
+
+<div align="center">
+<img width="800" alt="image" src="assets/figmethod.pdf">
+<p>The pipeline of our method, a holistic training and inference framework for closed-loop driving. It consists of two main modules:
+(a) Long-term driving-world model, for aligning DINOv3 features extracted from future multi-frame RGB images in the BEV space
+during training. (b) An adaptive CoT module for integrating external knowledge to enhance reasoning and decision-making in long-tail
+cases</p>
+</div>
 
 ## 🗓️ TODO
 - [ ] Release DeepSight reasoning code
