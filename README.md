@@ -340,8 +340,8 @@ Runs the Bench2Drive evaluation leaderboard pipeline with the trained Qwen model
 This project is distributed under the terms described in the [LICENSE](LICENSE) file.
 
 ## 🗓️ TODO
-- [ ] Release DeepSight reasoning code
-- [ ] Release whole DeepSight code
+- [x] Release DeepSight reasoning code
+- [x] Release whole DeepSight code
 - [ ] Release checkpoints
 <p align="right"><a href="#readme-top"><img src=https://img.shields.io/badge/back%20to%20top-red?style=flat
 ></a></p>
