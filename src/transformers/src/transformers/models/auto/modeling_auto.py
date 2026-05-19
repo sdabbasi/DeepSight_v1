@@ -569,7 +569,7 @@ MODEL_FOR_PRETRAINING_MAPPING_NAMES = OrderedDict(
         ("mamba", "MambaForCausalLM"),
         ("mamba2", "Mamba2ForCausalLM"),
         ("megatron-bert", "MegatronBertForPreTraining"),
-        ("mistral3", "Mistral3ForConditionalGeneration"),
+
         ("mistral4", "Mistral4ForCausalLM"),
         ("mllama", "MllamaForConditionalGeneration"),
         ("mobilebert", "MobileBertForPreTraining"),
@@ -1024,7 +1024,7 @@ MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES = OrderedDict(
         ("llava_next_video", "LlavaNextVideoForConditionalGeneration"),
         ("llava_onevision", "LlavaOnevisionForConditionalGeneration"),
         ("minicpmv4_6", "MiniCPMV4_6ForConditionalGeneration"),
-        ("mistral3", "Mistral3ForConditionalGeneration"),
+
         ("mistral4", "Mistral4ForCausalLM"),
         ("mllama", "MllamaForConditionalGeneration"),
         ("ovis2", "Ovis2ForConditionalGeneration"),
