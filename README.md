@@ -343,7 +343,7 @@ This project is distributed under the terms described in the [LICENSE](LICENSE) 
 ### Weights
 | Resource | Link |
 | :--- | :--- |
-| **Model Weights** | [DeepSight on ModelScope](https://www.modelscope.cn/models/hotdogcheese/deepsight) [DeepSight on HF]([https://www.modelscope.cn/models/hotdogcheese/deepsight](https://huggingface.co/zhangthu/deepsight)) |
+| **Model Weights** | [DeepSight on ModelScope](https://www.modelscope.cn/models/hotdogcheese/deepsight) [DeepSight on HF](https://huggingface.co/zhangthu/deepsight) |
 | **Dataset** | [b2d_deepsight on ModelScope](https://modelscope.cn/datasets/hotdogcheese/b2d_deepsight) |
 
 
