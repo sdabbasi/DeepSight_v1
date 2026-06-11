@@ -1,0 +1,21 @@
+# DeepSight — dependencies for OFFLINE (open-loop) inference / eval.
+# Closed-loop CARLA evaluation needs a separate Python 3.10 env with carla==0.9.16
+# (see example.txt); those deps are intentionally NOT listed here.
+#
+# NOTE: the repo's patched Qwen2.5-VL model is applied ON TOP of an installed
+# transformers (>=4.56, which already ships models/dinov3_vit) by
+# `scripts/setup_local_inference.py` — see RUN_LOCAL_INFERENCE.md. Do not try to
+# `pip install -e src/transformers`; that vendored fork is an incomplete tree.
+
+torch==2.6.0
+transformers>=4.56,<4.57
+accelerate>=1.0
+safetensors>=0.4
+qwen-vl-utils>=0.0.8
+huggingface-hub>=0.34
+modelscope>=1.37          # only needed to pull the b2d_deepsight / dataset listings
+numpy<2.0
+opencv-python>=4.8
+pillow>=10.0
+tqdm>=4.66
+matplotlib>=3.7           # optional: trajectory plots in src/tools/eval_l2.py
