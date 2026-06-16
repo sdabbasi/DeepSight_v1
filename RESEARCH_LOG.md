@@ -735,3 +735,278 @@ all 4 (≈4 h if `num_train_epochs: 1`, or run E2-1 and E2-2 as two separate ses
 
 **Read-out plan:** compare held-out 1s/2s L2 of λ=2 vs λ=0 *within each pair*. λ=2 better ⇒
 world loss helps the policy (JEPA upgrades a working component); tie ⇒ decorative (reframes JEPA).
+
+### E2 RESULTS (4 arms): world loss helps in the competent regime, inconclusive from scratch
+
+All 4 arms ran with auto-eval. Train losses from `run.log`; held-out L2 (500 unseen samples)
+from `eval.log` (`ALL SCENES`).
+
+| Sub-exp / arm | train `loss_rec` (last-50) | train `loss_gen` (last-50) | held-out L2 1s | 2s | **avg** | parsed |
+|---|---|---|---|---|---|---|
+| **E2-1** randinit **λ=0** | 0.517 | **1.82** (untrained) | 1.034 | 3.032 | **2.033** | 339/500 |
+| **E2-1** randinit **λ=2** | 0.530 | 0.27 (trained ↓) | 1.459 | 3.039 | **2.249** | 307/500 |
+| **E2-2** preinit **λ=0** | 0.327 | **0.49** (drifted ↑) | 0.790 | 1.808 | **1.299** | 500/500 |
+| **E2-2** preinit **λ=2** | 0.303 | 0.04 (kept low) | 0.700 | 1.583 | **1.142** | 500/500 |
+
+**Knob sanity — passes.** λ=0 → `loss_gen` gets no gradient (randinit leaves it ~1.8; preinit
+lets it **drift up** 0.016→0.49 as trajectory-only FT pulls representations off the DINOv3
+targets). λ=2 → `loss_gen` optimized down. `loss_rec` reaches a similar low in both arms of a
+pair → trajectory-fit capacity matched; held-out differences are about **generalization**.
+
+**E2-1 (random-init): inconclusive (as predicted).** Both arms near-useless on held-out
+(avg ~2.0–2.2 m; 2s ≈ 3 m), and 161/193 of 500 samples **unparseable** — so the L2s are
+averaged over *different* subsets (339 vs 307) and aren't comparable. 2000 samples / 2 epochs
+is far too little for a 3B model from scratch → treat E2-1 as **null**.
+
+**E2-2 (released ckpt): λ=2 measurably better — clean signal.** Both arms parsed **500/500**
+(identical set → comparable). World loss lowers held-out L2 across both horizons:
+1s 0.700 vs 0.790, 2s 1.583 vs 1.808, **avg 1.142 vs 1.299 → ≈12% lower with λ=2**. Mechanism
+is visible in training: with λ=0 the inherited world representation **degrades** (`loss_gen`
+0.016→0.49) and L2 worsens; with λ=2 it's preserved (0.04) and L2 improves. So the world loss
+acts as a **representation regularizer that keeps the policy dynamics-aware** during fine-tuning.
+
+**Expectations vs. outcome.** E2-1 matched the prediction (delta-only, unparseable, poor
+absolute → uninformative). E2-2: predicted *"realistic L2 but weaker/contaminated, effect
+likely small"*; the effect was **clearer than expected (~12%, both horizons, clean 500/500)**.
+The contamination (released model already world-loss-trained) didn't wash the signal out — it
+surfaced as *degradation-on-removal* (λ=0 lets the world representation rot, which held-out L2
+catches).
+
+**Verdict for JEPA. ⚠️ SUPERSEDED — see "E2 re-analysis" below.** (Originally read: "world
+objective is not decorative → green light for JEPA." On reflection this over-claimed: the E2-2
+comparison is confounded by a world-loss-pretrained init, so it does **not** establish that the
+world objective helps the policy. Retracted; corrected design below.)
+
+**Caveats / follow-ups.** (1) No untrained-base reference — both preinit arms FT'd at lr 1e-4
+and may have *degraded* vs base `checkpoints/deepsight`; eval the base on this held-out set to
+know whether the λ gain is "less degradation" vs "real gain". (2) Lower preinit lr to 2e-5 to
+cut forgetting and sharpen the signal. (3) E2-1 needs much more compute (or LoRA-on-frozen) for
+a clean from-scratch answer.
+
+### 2026-06-16 — E2 re-analysis: the result does NOT prove the claim; a properly controlled design
+
+**Why E2-2 does not establish "the world objective helps the policy."** The released
+checkpoint was **already trained with the world loss**, so its useful, dynamics-aware
+representations are *pre-baked*. The two arms therefore compare:
+- **λ=2:** keep the world loss → those pre-baked representations are **preserved**;
+- **λ=0:** drop it → they **drift/rot** (training shows `loss_gen` 0.016 → 0.49).
+
+So the ≈12% held-out gap measures **"how much removing the world loss damages an
+already-world-trained model,"** not **"how much the world loss adds."** Two further holes:
+there is **no absolute baseline** (the un-fine-tuned base was never scored on the held-out set,
+so we can't tell whether λ=2 *improved over base* or merely *degraded less*), and it is a
+**single seed** (a 12% gap can be seed noise). E2-1, which *had* a neutral (random) init, was
+too undertrained to learn the task (high unparseable, null delta). **Net: neither arm answers
+the question.** The earlier "green light" verdict is retracted.
+
+**The core flaw is the starting point.** A valid ablation changes only the variable under test
+*and* starts from an init that is **neutral with respect to that variable**. A model already
+trained with the world loss is not a neutral baseline for testing the world loss. Everything
+else in E2 (same data/schedule, only λ toggled, same pipeline) was correct — only the init was
+contaminated.
+
+**Required properties of a valid, *comparable* ablation:** (a) init **neutral** w.r.t. the
+world loss; (b) init **capable** enough to learn the task within budget (else null, like E2-1);
+(c) identical architecture across arms — both keep the BEV tokens + `vis_head`, toggling only
+the `loss_gen` *supervision*; (d) identical data/compute, **≥2–3 seeds** (auxiliary-loss effects
+are small/noisy); (e) always report the **base (no-train) reference** so direction is visible.
+
+**Design options considered (and why the chosen one wins):**
+
+| Option | Neutral init? | Capable in budget? | Verdict |
+|---|---|---|---|
+| Full **randinit** from scratch, more compute | ✅ | ❌ (3B from scratch needs web-scale; E2-1 already null) | infeasible |
+| **Frozen backbone + LoRA** from released ckpt | ❌ (frozen features already world-shaped) | ✅ | confounded — same flaw as E2-2 |
+| **"Wash out" world loss** from released, then branch | ⚠️ ill-defined ("how washed?") | ✅ | arbitrary; rejected |
+| **Warm-start from base Qwen2.5-VL-3B** + random DeepSight heads | ✅ (base VLM never saw the world loss/BEV task) | ✅ (pretrained → converges fast on small data) | **chosen** |
+
+**Chosen approach — E2′ (neutral-capable init).** Build the init the way the authors did
+*before* their training: take **base Qwen2.5-VL-3B** (pretrained general VLM — capable but
+task-neutral), graft it into the DeepSight architecture (LLM + vision tower from base; resize
+embeddings for the added `<|bev_token|>`/`<|pixel_token|>` rows = random; `vis_head` random;
+**frozen pretrained DINOv3**). Then run the **identical** protocol, toggling only λ∈{0,2}:
+- same train/held-out split, same compute, **multiple seeds**;
+- both arms have the BEV tokens + `vis_head` in-graph — only `loss_gen` supervision differs;
+- report `base` (no-train) vs `λ=0` vs `λ=2` held-out L2.
+
+Because the init is neutral, any λ effect is attributable to the world objective; because the
+backbone is *pretrained*, both arms can actually learn the task in our budget (unlike randinit).
+This also becomes the **fixed protocol** for all later changes (JEPA target, action-conditioning,
+…): same init/data/compute/seeds/eval, vary one component → every result is apples-to-apples.
+
+**Residual honesty.** Even E2′ tests "does the world loss help when fine-tuning a pretrained
+VLM on a *small* driving set" — not "at DeepSight's full training scale" (only the authors'
+scale could show that). The effect may also need **more train data** than 2000 to surface
+(auxiliary-loss benefits often grow with data). Both are acceptable, stated limitations.
+
+**Status: design only — to implement on request.** Build steps will be: (1) download base
+Qwen2.5-VL-3B; (2) a `make_warmstart_init.py` (load base weights into the DeepSight arch +
+resize embeddings + random heads + frozen pretrained DINOv3); (3) E2′ configs (λ0/λ2, ≥2 seeds);
+(4) base-reference eval; (5) run via the fixed protocol + auto-eval.
+
+### E2-3: concrete build + run plan (warm-start neutral-capable init)
+
+E2-3 is the executable form of the E2′ design above. Goal restated in one line: **with a
+*neutral-but-capable* init, does adding the DINOv3 world loss (λ=2) beat not adding it (λ=0),
+both measured against the no-train base?** Below is grounded in the actual checkpoints (verified
+2026-06-16), so the grafting is exact rather than hand-wavy.
+
+**Architecture inventory (from `checkpoints/deepsight/`).** Weight groups in the released
+checkpoint: `model.*` (434 keys = Qwen2.5 LLM), `visual.*` (390 = Qwen vision tower),
+`dinov3.*` (415 = frozen DINOv3 target extractor), `lm_head.weight`, `vis_head.weight`
+(the 2048→1024 world-latent head). Config: `vocab_size = 153536`, `hidden_size = 2048`,
+`tie_word_embeddings = None` (⇒ `lm_head` is **untied** — must be grafted separately from
+`embed_tokens`). Base Qwen2.5-VL-3B vocab = 151936 ⇒ **resize delta = 1600 rows.**
+
+**⚠ The vocab is NOT a clean append** (verified): of 1305 `<|bev_token|>` rows, **265 reuse
+base's reserved tail** (ids 151671–151935, inside the base 151936 range — these are Qwen's
+unused/reserved padding slots) and the rest, plus all `<|pixel_token|>` (511) and `<CoT_flag_*>`
+etc., occupy the **1600 genuinely-new** rows (ids 151936–153535). Implication for the graft:
+copy base rows `[0:151936]` wholesale into the DeepSight `embed_tokens`/`lm_head` and random-init
+only rows `[151936:153536]`. The 265 bev tokens sitting in `[0:151936]` thus inherit base's
+*reserved-row* embeddings — harmless (bev tokens are learnable placeholders) and **identical
+across both arms**, so it cannot bias the ablation.
+
+**Init recipe — `scripts/make_warmstart_init.py`** (new file; modeled on `make_random_init.py`,
+which already proves the config-construct + selective-load pattern). Build the DeepSight arch
+from the released `config.json` (gets vocab 153536, `dinov3_config`, `visual_target_dim`, etc.),
+then populate weights per-group:
+
+| Weight group | Source in E2-3 | Rationale |
+|---|---|---|
+| `model.*` (LLM) | **base Qwen2.5-VL-3B** | capable, world-loss-neutral |
+| `visual.*` (vision tower) | **base Qwen2.5-VL-3B** | same |
+| `embed_tokens` / `lm_head` | base rows `[0:151936]`; rows `[151936:153536]` **random** | new bev/pixel/CoT tokens unseen by base |
+| `vis_head` | **random** | world head must be neutral (never pretrained) |
+| `dinov3.*` | **pretrained**, loaded from `checkpoints/deepsight/` (`--keep-dino-pretrained` logic) | it is *Meta's frozen DINOv3 target extractor*, never trained by DeepSight ⇒ neutral w.r.t. the world **loss**; needed so `loss_gen` has a meaningful (not random) target |
+
+Tokenizer/processor copied from `checkpoints/deepsight/` (so the bev/pixel vocab is already
+correct — same trick `make_random_init.py` uses to avoid hand-registering tokens). Save with
+`--seed` so the random rows (`vis_head`, new-token embeddings) are reproducible per seed.
+
+> Why pretrained DINOv3 is still "neutral": the contamination in E2-2 was that the **LLM/heads**
+> had already been *trained by the world loss*. DINOv3 here is only the fixed feature *target*;
+> using Meta's pretrained weights is exactly what a from-the-authors'-start init would do, and it
+> is identical across λ=0 and λ=2 arms. (λ=0 simply never consults it.)
+
+**Arms & seeds (5 evaluations).**
+
+| Arm | Init | λ_world | Train? |
+|---|---|---|---|
+| `base` (reference) | warm-start init, **no training** | — | no |
+| `λ0/seedA`, `λ0/seedB` | warm-start init | 0.0 | yes |
+| `λ2/seedA`, `λ2/seedB` | warm-start init | 2.0 | yes |
+
+Two seeds per λ (seeds {0,1}) → 4 training runs + 1 no-train eval. Seeds vary **both** the random
+graft rows *and* the data-shuffle/trainer seed. (Stretch: add seed 2 → 6 runs if time allows;
+auxiliary-loss effects are small, so ≥2 seeds is the floor for believability.)
+
+**Configs.** Clone the E2 configs to `configs/ad_bev_e2_3_lambda{0,2}_seed{0,1}.yaml`. Identical
+across all arms **except** `world_loss_weight` and `seed`:
+`model_name_or_path: checkpoints/deepsight_warmstart`; `finetuning_type: full`;
+`freeze_vision_tower: false` (matches the released recipe **and** E2-2, so results transfer —
+the vision tower is the same pretrained one in every arm, so this stays a controlled variable);
+dataset = the same 2000-train / 445-held-out `e2_overfit_lambda` registry; `num_train_epochs: 2`;
+`lr: 1.0e-4`; `lr_scheduler: constant`; `warmup_steps: 10`; `save_strategy: "no"` (one final
+model); `seed: <0|1>`. DINOv3 stays frozen as in the released recipe (it is a target extractor).
+
+**Run + eval (fixed protocol, unchanged tooling).** Per arm:
+`CUDA_VISIBLE_DEVICES=0,1,2 FORCE_TORCHRUN=1 scripts/train.sh configs/ad_bev_e2_3_lambdaX_seedY.yaml
+deepspeed=examples/deepspeed/ds_z2_config.json --eval local_data/e2_overfit_lambda/heldout_infer.jsonl`
+— ZeRO-2 is mandatory (3B full-finetune DDP OOMs, learned in E1). `train.sh` already produces the
+timestamped run dir, `run.log`, 3-loss plot, and the held-out open-loop L2 in the same dir. The
+`base` reference is the same `--eval` path pointed at `checkpoints/deepsight_warmstart` with no
+training (or `src/infer_local_multi_gpu.py` directly).
+
+**Resource / time estimate.** Same data and schedule as E2 (2000×2 epochs on 3 GPUs), so each arm
+≈ one E2 arm's wall-time; 4 training arms + base eval fit the same ≤6 h budget E2 used. Disk:
+`make_warmstart_init.py` writes one ~7 GB checkpoint (`deepsight_warmstart`) reused read-only by
+all arms; per-run saves are the final model only (`save_strategy: "no"` keeps rolling ckpts off).
+
+**Decision rule (pre-registered, so we don't post-hoc rationalize).** Report mean±range of
+held-out L2 over seeds for `base`, `λ0`, `λ2`.
+- **World loss helps** ⇔ `λ2 < λ0` by a margin **larger than the seed spread**, *and* `λ2 < base`
+  (it must improve over the untrained start, not merely "degrade less" — the exact hole E2-2 had).
+- `λ0 ≈ λ2` within seed noise ⇒ **no measurable benefit at this scale** (honest null; still a
+  valid, comparable result — unlike E2-2).
+- `λ2 > base` (both arms fail to beat the untrained model) ⇒ the **2000-sample budget is too
+  small** to learn the task; revisit data size before concluding anything about the world loss.
+
+**Carry-over caveats** (from the E2′ analysis, unchanged): this tests the world loss when
+*fine-tuning a pretrained VLM on a small set*, not at DeepSight's full pretraining scale; a real
+benefit may only surface with more data. Stated, accepted.
+
+**Status: init built; ⚠️ TRAINING REGIME REVISED — the `finetuning_type: full` /
+`freeze_vision_tower: false` choice above is SUPERSEDED by the LoRA decision below.** The
+*init* (warm-start) and the *ablation logic* (neutral init, toggle only λ, base reference,
+multi-seed, the decision rule) all stand unchanged; only **how we train on top of that init**
+changed. Build progress so far: base Qwen2.5-VL-3B downloaded → `checkpoints/Qwen2.5-VL-3B`;
+`scripts/make_warmstart_init.py` written & run → `checkpoints/deepsight_warmstart` (+ a seed-1
+init was *not* needed — seeds only vary data order, init is fixed); smoke-tested (loads on
+multi-GPU, generates; untrained `base` anchor is appropriately weak). The four full-FT configs
+were a first cut; they are replaced per the regime decision below.
+
+### E2-3 training regime: LoRA, not full fine-tune (final decision to implement)
+
+**The decision.** E2-3 trains a **LoRA** adapter on the LLM trunk with the world head and the
+new-token rows fully trainable, the Qwen ViT and DINOv3 frozen — *not* full fine-tuning.
+
+**Why (judged against E2's actual goal, not paper faithfulness).** E2 exists to give a
+**reliable, reproducible testbed that isolates the world head's marginal effect** and is reused
+to compare *future* world-head designs (JEPA target, predictors, action-conditioning). The right
+metric is therefore **signal-to-noise on the head's contribution, at low cost, held fixed across
+variants** — not resemblance to the paper recipe. On that metric:
+- **Reliability = effect ÷ noise.** Full-FT makes all 3.7B params plastic on only 2000 samples →
+  the policy loss alone can fit the task, so the world head is one of two forces on a fully-moving
+  trunk and its small contribution is buried in high seed variance (overfitting). LoRA pins the
+  pretrained trunk and adds a regularized low-rank delta → it **cuts variance far more than it cuts
+  the effect** → a true small effect becomes *detectable*.
+- **Sensitivity to the head specifically.** With a fully-plastic trunk, any *future* world-head
+  change washes out against the moving backbone. With the trunk pinned, the policy reads near-fixed
+  base features + a small shared delta, so the world objective's reshaping of that shared substrate
+  stays in sharp relief — the protocol remains attributable to the head across variants.
+- **Reproducibility as a fixed protocol.** Future contributions are all changes to *how the world
+  objective is computed*; everything else must be cheap to hold fixed and rerun. LoRA is
+  single-GPU, fast, stable → the full multi-seed ablation can be re-run for each new head idea,
+  apples-to-apples. Full-FT (ZeRO-2, multi-GPU, hours/arm) is too costly to be the recurring harness.
+
+Full-FT on 2000 samples wins only "faithfulness," which is **not** E2's goal — and it buys no real
+external validity anyway (1% of the paper's data with the paper's optimizer is cosmetic resemblance).
+So full-FT-on-small-data loses on every axis that matters here; LoRA is the genuine choice, not a
+cost compromise. The world head's gradient mechanism is preserved: `loss_gen` still flows into the
+trunk via the LoRA delta (so the world objective shapes the representations the policy reads); a
+*frozen* LLM would cut that pathway and was ruled out.
+
+**Regime — what trains, what's frozen (the fixed E2-3 / future-head harness):**
+
+| Component | Setting | Why |
+|---|---|---|
+| LLM trunk (`model.language_model.*`) | **LoRA**, rank **64**, `lora_target: all` | shared substrate the world loss shapes; low-variance, regularized |
+| World head (`vis_head`) | **fully trainable** (`additional_target`) | the object under test — must have full capacity |
+| New-token rows (`embed_tokens` / `lm_head`) | **fully trainable** (`additional_target`) | start random; must converge or both arms are null (E2-1 trap) |
+| Qwen ViT (`model.visual.*`) | **frozen** | pinned substrate keeps the head's effect isolated; cuts params/noise |
+| DINOv3 (`dinov3.*`) | **frozen** (forced in code) | target feature extractor only |
+| Init | `checkpoints/deepsight_warmstart` | neutral-capable warm-start (unchanged from the design above) |
+| `num_train_epochs` | **~5** (up from 2) | LoRA underfits faster — ensure the task is actually learned before reading the effect |
+| `learning_rate` | **2.0e-4** | LoRA tolerates/needs a higher LR than full-FT |
+| seeds | **≥2** (cheap now) | estimate the noise floor for the decision rule |
+| λ_world arms | **{0, 2}** | the ablation variable |
+
+**Unchanged from the design above:** neutral-capable warm-start init; identical setup across arms
+toggling only λ (and seed); the `base` (no-train) reference; the **pre-registered decision rule**
+(world loss helps ⇔ `λ2 < λ0` beyond seed spread *and* `λ2 < base`).
+
+**Honest scope (this is a deliberate trade, not an oversight).** LoRA measures the head's effect
+when adapting a *pinned* trunk — it does not predict the paper's full-FT-at-scale numbers. This
+caveat applies to *any* small-scale probe (full-FT on 2000 included), so it is not a reason to
+prefer full-FT; it is a scope statement. E2's purpose is a reliable comparator for world-head
+designs, and this is exactly the harness every future world-head idea will be run through.
+
+**One plumbing change vs the design above.** LoRA run dirs are *adapters*, so the auto-eval needs
+a **merge-before-eval** step (`llamafactory-cli export` to fold the adapter + `additional_target`
+modules into a full checkpoint, then the existing infer/eval runs unchanged on that merged dir).
+
+**Status: regime decided — to implement.** Build order when greenlit: (1) rewrite the 4 configs
+to `finetuning_type: lora` with the knobs above; (2) add the merge-before-eval step to
+`scripts/train.sh`; (3) run the 4 arms + `base` eval; (4) tabulate vs the decision rule under
+this day's log.
