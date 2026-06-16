@@ -333,13 +333,13 @@ slice of data:
 - *Eval* — existing [eval_l2.py](src/tools/eval_l2.py) (1s/2s open-loop L2) + the multi-GPU
   inferer. (The L2 is not yet paper-matched; for E2 we only need the *relative* λ=0 vs λ=2
   comparison, so the convention need not match the paper.)
-- *A `λ_world` knob* (needed by E2; nice for E3). Today the weight is **hard-coded**
-  `loss = loss_rec + 2*loss_gen` in
-  [modeling_qwen2_5_vl.py:~1544](src/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py#L1544).
-  Per the file-edit discipline it will be exposed **reversibly** — preferred: read an env var
-  (e.g. `DEEPSIGHT_LAMBDA_WORLD`, default `2.0`) at that line, introduced via a patched *copy*
-  of the modeling file that the `setup_local_inference.py` shim points at (originals
-  untouched; revertible). Decide the exact mechanism at implementation time.
+- *A `λ_world` knob* — **IMPLEMENTED 2026-06-15 as a config-driven YAML arg** (`world_loss_weight`).
+  The weight was hard-coded `loss = loss_rec + 2*loss_gen`; it is now
+  `loss = loss_rec + getattr(self.config, "world_loss_weight", 2.0)*loss_gen`. Three minimal
+  comment-and-add edits (default 2.0 → original behavior preserved): the field on
+  `FinetuningArguments`, the wiring `model.config.world_loss_weight = finetuning_args.world_loss_weight`
+  in `train/sft/workflow.py`, and the read in `modeling_qwen2_5_vl.py`. Set it in any training
+  YAML (`world_loss_weight: 0`/`2`). The earlier env-var/shim idea was rejected (too implicit).
 
 **Shared caveat — choice of start checkpoint.** Fine-tuning *from the released (converged)
 checkpoint* makes any "improvement" nearly invisible (it's already near-optimal on
@@ -386,16 +386,24 @@ used; it changes interpretation.
 
 ### E2 — World-loss ablation (does the world objective help the policy?)
 
+Split into **two sub-experiments** (user decision 2026-06-15), each with λ∈{0,2} arms (4 runs
+total), short ≤6h combined:
+- **E2-1 (random-init):** both arms from `deepsight_randinit` (identical start) → the held-out
+  L2 *delta* is a causally clean attribution to `loss_gen`. Absolute L2 will be poor
+  (undertrained 3B) and randinit may emit some unparseable trajectories — only the delta counts.
+- **E2-2 (released ckpt):** both arms continue-finetune from `checkpoints/deepsight` → realistic
+  trajectories/L2. Caveat: that ckpt is already world-loss-shaped, so λ=0 continued-FT doesn't
+  undo it — a weaker/contaminated test; evaluate on the weakest scenarios for sensitivity.
+
 - **Question / hypothesis.** Does the world loss improve the **action output**? Two short
   runs identical except the world weight: **`λ_world = 0`** (text-only) vs **`λ_world = 2`**
   (stock). Compare **held-out open-loop L2**.
-- **Design.** Same small diverse subset, same seed / steps / LR / batch for both arms; only
-  `DEEPSIGHT_LAMBDA_WORLD` differs. After each run, infer on the held-out split and score
-  with `eval_l2.py`. Base off [ad_bev_train_local.yaml](configs/ad_bev_train_local.yaml) →
-  `configs/ad_bev_ablate_lambda0.yaml` (+ the stock-λ run for the other arm). Keep the runs
-  short (time-boxed; this is a *relative* comparison, not a reproduction).
-- **Start point.** See shared caveat — prefer `randinit` (headroom) **or** released-ckpt +
-  weakest-scenario held-out eval. Both arms must share the identical start.
+- **Design.** Same train subset, same seed / steps / LR / batch for both arms; only
+  `world_loss_weight` differs (set in the training YAML — knob now implemented, see above).
+  λ=0 config built: [configs/ad_bev_overfit_lambda0.yaml](configs/ad_bev_overfit_lambda0.yaml)
+  (overfit template; the real E2 arms will be train-data configs). After each run, infer on the
+  held-out split and score with `eval_l2.py`. Keep runs short (relative comparison, not a repro).
+- **Start point.** E2-1 randinit / E2-2 released (both arms share the identical start within each).
 - **Measure.** Held-out 1s/2s L2 for λ=0 vs λ=2; secondary: `loss_rec` trajectory-token CE,
   and the loss curves.
 - **Success / interpretation.**
@@ -627,9 +635,103 @@ positions — **no plumbing bug; capacity sufficient.** The noisy descent is exp
 `training_loss.png` is monotone. Caveat: this proves *capacity*, not generalization (that's
 E2/E3). **Pipeline sound → proceed to E2.**
 
-> Tooling added alongside this result (so future experiments are clean and non-destructive):
-> `scripts/train.sh` (timestamped run dir `saves/<exp>/<unixtime>_<exp>/`, automatic
-> `run.log`, config-driven `# SAVE_MODEL`/`# LOG` directives); each training config now uses
-> its **own** private `dataset_dir` (`local_data/e1_overfit`, `train_smoke`, `train_local`);
-> and `data/dataset_info.json` was reverted to its original upstream (NAS) state — no longer
-> used by any local config.
+> Tooling added alongside this result: `scripts/train.sh` (launcher) + per-config private
+> `dataset_dir`s. Its save behavior was reworked on 2026-06-15 — see that day's log entry.
+
+### 2026-06-15 — training-launch tooling: config-driven saving, 3-loss plot, general multi-GPU
+
+Hardened the E-experiment training harness (no original repo files touched):
+
+- **Saving is now config-driven, not wrapper-driven.** The earlier approach had
+  `llamafactory-cli` write the model and the wrapper delete it via a magic `# SAVE_MODEL`
+  comment — unintuitive (a commented line silently acting) and wasteful (write-then-delete).
+  Removed it. Saving is controlled purely by real config args: all three configs use
+  `save_strategy: "no"` → the workflow's single unconditional `trainer.save_model()`
+  ([workflow.py:100](src/llamafactory/train/sft/workflow.py#L100)) writes **exactly one**
+  final model, no `checkpoint-*/` dirs. Note: there is **no** config that saves *zero*
+  models (that final save is unconditional) — throwaway runs are `rm -rf`'d manually.
+  `ad_bev_train_local.yaml` now carries a **commented** block of alternative strategies
+  (rolling checkpoints / per-epoch / best-by-eval-loss) to uncomment when needed.
+- **`scripts/train.sh` is now a thin wrapper:** timestamped run dir
+  `saves/<exp>/<unixtime>_<exp>/`, always-on `run.log`, and the 3-loss plot. It no longer
+  parses directives or touches weights.
+- **3-loss plot** (`scripts/plot_losses.py`): parses the model's per-forward
+  `loss/loss_rec/loss_gen` prints from `run.log` → `losses_split.png` (three descending
+  curves, log-y) — recovering the rec/gen split the trainer doesn't log, without editing the
+  model/trainer.
+- **General multi-GPU** documented in [RUN_LOCAL_TRAINING.md](RUN_LOCAL_TRAINING.md) (Step 3):
+  any config on N GPUs via `CUDA_VISIBLE_DEVICES=<list> FORCE_TORCHRUN=1 scripts/train.sh
+  <config>` (CLI auto-launches torchrun→DDP; DeepSpeed optional). So E1 on 2 GPUs is just the
+  general pattern applied to `configs/ad_bev_overfit.yaml`.
+
+Net: configs are lean (usage-only; rationale lives in the RUN/RESEARCH docs), saving is
+predictable and standard, and every run self-documents via `run.log` + `losses_split.png`.
+
+### E1 re-verified (PASS); λ_world knob implemented (config-driven); E2 scoped
+
+- **E1 full re-check: PASS.** Audited every E1 file (config, registry, the 30-sample jsonl —
+  all 15-img paths exist, 6 scenes × 5; train.sh + plot_losses syntax OK; modeling print
+  intact). Run `1781518102_…`: `loss_rec` 12.3→min 0.0014, `loss_gen` 1.78→min 0.017, total
+  min 0.078 — both losses driven down on the *diverse* set. Pipeline sound.
+- **λ_world knob — config-driven (not env/shim).** After weighing options the user chose a
+  minimal 1-line edit over a 1500-line file copy. Implemented as a real YAML arg
+  `world_loss_weight` (default 2.0 = unchanged behavior) via 3 comment-and-add edits:
+  `FinetuningArguments` field, wiring in `train/sft/workflow.py`
+  (`model.config.world_loss_weight = finetuning_args.world_loss_weight`), and the read in
+  `modeling_qwen2_5_vl.py` (`getattr(self.config, "world_loss_weight", 2.0)`; original line
+  kept commented). **Verified end-to-end without training:** parser accepts the YAML key and
+  it flows to `finetuning_args` (0.0 for the λ=0 config, 2.0 for λ=2); all originals still
+  compile. Set λ=2 explicitly in `ad_bev_{overfit,train_smoke,train_local}.yaml`; added the
+  λ=0 ablation config `configs/ad_bev_overfit_lambda0.yaml`. (Earlier env-var/shim version was
+  reverted.)
+- **E2 scoped** into **E2-1 (random-init, clean delta)** and **E2-2 (released ckpt, realistic)**,
+  λ∈{0,2} each, short ≤6h budget — see the Planned-Experiments E2 spec above.
+- **Next:** build the disjoint **train / held-out** split + the E2 train-data configs (the
+  current λ=0 config is the overfit template), then run the 4 arms and compare held-out L2.
+  Optional final knob confirmation: a 1-step `scripts/train.sh configs/ad_bev_overfit_lambda0.yaml`
+  should print `loss == loss_rec`.
+
+### E2 finalized — 4 configs, 2000/500 data split, auto-eval wired (design; no results yet)
+
+The E2 ablation is now fully set up and ready to run (results to be discussed in a later log).
+
+**The 4 runs** = 2 sub-experiments × 2 λ arms, identical within a pair except `world_loss_weight`:
+
+| Config | Init | `world_loss_weight` |
+|---|---|---|
+| `configs/ad_bev_overfit_lambda2_randinit.yaml` | `deepsight_randinit` | 2.0 |
+| `configs/ad_bev_overfit_lambda0_randinit.yaml` | `deepsight_randinit` | 0.0 |
+| `configs/ad_bev_overfit_lambda2_preinit.yaml`  | `checkpoints/deepsight` (released) | 2.0 |
+| `configs/ad_bev_overfit_lambda0_preinit.yaml`  | `checkpoints/deepsight` (released) | 0.0 |
+
+- **E2-1** = the two `*_randinit` arms (clean λ-delta from identical random init; absolute L2
+  will be poor, only the delta is meaningful). **E2-2** = the two `*_preinit` arms (realistic
+  L2 from the released model; weaker test since that ckpt is already world-loss-shaped).
+- Shared schedule: full finetune, `num_train_epochs: 2`, lr `1e-4` constant + 10 warmup steps,
+  bs 1, `save_strategy: "no"` (one final model). lr is uniform across all 4 (ablation valid);
+  for the preinit pair `1e-4` is aggressive — drop both to `2e-5` if they degrade vs base.
+
+**Data** (`local_data/e2_overfit_lambda/`, registry `dataset_info.json` → the train file):
+- `overfit_samples_bigger.jsonl` — **2000** train samples (15-img), 110 scenes, 39 scenario types.
+- `heldout_infer.jsonl` — **500** held-out samples (10-img), 45 scenes, 24 scenario types.
+- Built from a **disjoint scene split** (train = shuffled `ready_scenes`[:110], held-out =
+  [110:155]) → verified **0 sample overlap**. More data + a genuinely unseen, diverse held-out
+  set = lower-variance, generalization-measuring L2 (the right signal for the λ ablation).
+
+**Auto-eval** (`scripts/train.sh --eval <heldout.jsonl>`): after training, the wrapper runs
+inference with the just-saved checkpoint on the held-out set + `eval_l2.py`, writing results
+**into the run dir** (`saves/<arm>/<unixtime>_<arm>/`: `heldout_infer.json`, `eval_plots/`,
+`eval.log`) — not `debug/`. (`src/infer_local_multi_gpu.py` auto-shards across the visible GPUs.)
+
+**Launch (per arm; multi-GPU needs the ZeRO override):**
+```
+CUDA_VISIBLE_DEVICES=0,1,2 FORCE_TORCHRUN=1 scripts/train.sh \
+    configs/ad_bev_overfit_lambda2_randinit.yaml \
+    --eval local_data/e2_overfit_lambda/heldout_infer.jsonl \
+    deepspeed=examples/deepspeed/ds_z2_config.json
+```
+**Estimated cost (3 GPUs, ZeRO-2):** ~1.5–1.7 h training + ~14 min eval per arm → ~7–8 h for
+all 4 (≈4 h if `num_train_epochs: 1`, or run E2-1 and E2-2 as two separate sessions).
+
+**Read-out plan:** compare held-out 1s/2s L2 of λ=2 vs λ=0 *within each pair*. λ=2 better ⇒
+world loss helps the policy (JEPA upgrades a working component); tie ⇒ decorative (reframes JEPA).
