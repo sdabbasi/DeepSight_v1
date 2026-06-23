@@ -1539,3 +1539,106 @@ small-scale regime.
 - Storage hygiene (same day): deleted all intermediate `saves/*/*/checkpoint-*` (1.4 TB→157 GB); run-root
   best models kept. One casualty — the **crashed** FT λ2 run `1781733356` never consolidated a root model, so
   its weights are gone (results/logs preserved; it was the superseded non-paper 2e-4 variant).
+
+---
+
+### Cont. — E2-4 designed & implemented: detect + prevent world-head collapse
+
+Direct follow-on to the collapse finding. Goal: (1) a permanent **collapse meter**, and (2) **objective-level
+prevention** tested cleanly on the *same* collapse-inducing small data, so any lift is a design fix not a
+data fix. Scope chosen: **A1 (cosine) + A2 (VICReg) on fixed data** (data-diversity arm A3 deferred).
+
+**Component 1 — collapse meter (the "check").** `scripts/probe_world_collapse.py`: wraps the validated
+forward-only probe (lr=0, `world_loss_type=mse` forced so it always reads RAW MSE), greps `loss_gen`, computes
+the DINOv3 baselines with the exact register mask, and prints **EV = 1 − loss_gen / MSE_perdim** plus
+EV-vs-per-pos. Verdict bands (from the 2026-06-22 measurements): **EV ≤ 10 % = COLLAPSED** (ours ~5 %),
+**EV ≥ 40 % = HEALTHY** (released 54 %). Objective-agnostic, so A0/A1/A2 are directly comparable.
+
+**Component 2 — prevention, config-driven.** New knob `world_loss_type ∈ {mse, cosine, vicreg}` (+
+`world_var_coeff`, `world_cov_coeff`) wired exactly like `world_loss_weight`
+(`finetuning_args.py` → `train/sft/workflow.py` → `model.config` → branch in `modeling_qwen2_5_vl.py` forward).
+Formulations:
+- **mse** (A0, control) — original plain MSE to raw DINOv3 (reproduces collapse).
+- **cosine** (A1) — `mean(1 − cos(pred, target))` on unit-normalized rows; removes the magnitude/per-dim-mean
+  trivial solution.
+- **vicreg** (A2) — `MSE_invariance + var_coeff·variance_hinge + cov_coeff·covariance`. **variance hinge** =
+  `mean_d relu(std_target[d] − std_pred[d])` (target std detached) — pushes each prediction dim's batch-std up
+  to the frozen target's per-dim std; catches the "predict one constant vector" collapse even at `b=1` (the
+  1285 bev-token rows per microbatch give the batch axis). **covariance** = mean squared **off-diagonal
+  correlation** of standardized predictions ∈[0,1] (scale-free; decorrelates dims / fights dimensional collapse).
+
+Configs: `configs/ad_bev_e2_4_{A0_mse,A1_cosine,A2_vicreg}_seed0.yaml` — clones of the collapsing FTpaper λ2
+recipe (lr 2e-5, eff-batch 64, full-FT, vision+DINOv3 frozen, e2_FT, warmstart), differing **only** in
+`world_loss_type`. A0 ≡ the existing run `1781858965` (can be reused/re-probed rather than rerun).
+
+**Validation done (no full runs yet).**
+- Args parse; loss-branch unit test on synthetic collapsed-vs-healthy predictions: mse 0.073/0.010,
+  cosine 0.97/0.06, vicreg 0.34/0.01 — every objective penalizes the collapsed solution far more than MSE
+  relative to a healthy one (cosine/vicreg create the steep escape gradient MSE lacks).
+- **vicreg end-to-end smoke** (real model, 2 GPU ZeRO-2, max_steps=2): runs clean, `loss_gen ≈ 15.8` at init
+  = the invariance MSE at random init (same as the plain-mse run's init), with var/cov bounded and small —
+  they engage only as the model drives `std_pred→0`. Two scale bugs found & fixed first: raw covariance blew up
+  (1120) → switched to **standardized correlation**; sum→**mean** off-diagonal (26→bounded).
+
+**Decision rule for the runs.** Primary = **EV via the meter** (did the arm escape collapse: EV well above the
+~5 % A0 floor, ideally ≥ per-pos i.e. beating 0.032). Secondary = **open-loop L2 λ0 vs λ2 under a non-collapsed
+head** — the first *fair* test of "does world modeling help the policy," now possible because the head learns.
+
+**Status:** infra complete & validated; the three arms are **not yet trained**. Next: run A1+A2 (reuse A0 from
+`1781858965`), then `probe_world_collapse.py` on each, tabulate EV + L2.
+
+---
+
+### 2026-06-23 — E2-4 first results: cosine improves L2; the MSE-EV meter is blind to non-MSE heads
+
+Ran the two prevention arms on the fixed collapsing data (full-FT, lr 2e-5, eff-batch 64, warmstart, e2_FT,
+early-stopped ~epoch 4.5 on best ckpt): **A1 cosine** = `1782155340_…A1_cosine_seed0`, **A2 vicreg** =
+`1782155405_…A2_vicreg_seed0`. **A0 = the existing mse run `1781858965`** (not retrained — A0's config is the
+old FTpaper λ2 recipe verbatim plus an explicit `world_loss_type: mse`, which is the default, so re-running it
+only reproduces the known collapse). Pre-flight: full train→save→load→generate→L2 pipeline validated end-to-end
+on the vicreg path, and the shared `modeling_qwen2_5_vl.py` change confirmed byte-identical for the `mse`
+default (A0 2-step forward → `loss_gen` 15.81/16.0 = original init), so old configs are unaffected; eval never
+runs the loss branch (`labels=None`).
+
+**Open-loop L2 (valid + cross-comparable; same 1000-sample test + eval_l2):**
+
+| Arm | 1s | 2s | overall | vs A0 |
+|---|---|---|---|---|
+| λ0 (no world loss, `1781858883`) | 0.594 | 1.398 | 0.996 | −0.010 |
+| **A0 mse / control (`1781858965`)** | 0.595 | 1.418 | **1.006** | — |
+| **A1 cosine** | 0.562 | 1.302 | **0.932** | **−0.074** |
+| **A2 vicreg** | 0.590 | 1.363 | **0.976** | −0.030 |
+
+A1 cosine improves **both** horizons (clearest gain, ~1.5× the ~0.05 sample-mean SE → plausibly real); A2 vicreg
+is marginal (within noise). Single seed ⇒ suggestive, not conclusive. NB: cross-arm `eval_loss` is NOT
+comparable (A1 ~0.84, A2 ~0.48, A0 ~0.34) because `eval_loss = loss_rec + 2·loss_gen` and `loss_gen` is in
+different units per objective — only L2 and a scale-invariant collapse metric compare across arms.
+
+**Collapse meter (`probe_world_collapse.py`, raw-MSE EV vs per-dim baseline 0.0414) — and its blind spot:**
+
+| Arm | raw MSE `loss_gen` | EV vs per-dim | meter says |
+|---|---|---|---|
+| A0 mse | 0.042 | ~5 % | collapsed (confirmed earlier) |
+| A1 cosine | **11.1** | −26743 % | "collapsed" — **INVALID metric** |
+| A2 vicreg | **0.057** | −38 % | "collapsed" — **misleading** |
+
+**Key finding: the MSE-EV meter is the wrong instrument for non-MSE heads.**
+- **A1 cosine — meter invalid.** Cosine loss is **scale-free** (constrains direction only), so prediction
+  magnitude is unconstrained; raw MSE (11.1) just measures that free scale, not collapse. EV is meaningless here.
+- **A2 vicreg — meter misleading.** MSE 0.057 is **above** the per-dim mean floor (0.0414) and the control's
+  0.042, which means vicreg did **not** collapse to the constant mean (the variance term *did* add spread) — but
+  the spread is **MSE-misaligned** with the targets (invariance term lost to the var/cov terms as tuned). Whether
+  the *direction* tracks the scene, raw MSE cannot say.
+
+So **"is there collapse?" is answerable only for A0 (yes); for A1/A2 the current meter cannot decide** — a real
+methodological result: **the collapse check must be objective-matched (scale-invariant).** The provisional read
+is A1 cosine = best L2 and the most promising, A2 vicreg = added (wrong) variance with no L2 payoff at these
+coefficients (`var=1.0, cov=0.04` may over-weight variance vs invariance).
+
+**Next steps.**
+1. **Build a scale-invariant collapse diagnostic** and re-judge A1/A2: cosine-EV (1 − cos_loss / mean-direction
+   baseline) and **cross-scene CKA** (representation similarity, scale/rotation-invariant), via an embedding
+   dump of `vis_head` predictions + DINOv3 targets. Only this can confirm whether cosine/vicreg escaped collapse.
+2. If A1 cosine is confirmed non-collapsed + better L2 → that's the first evidence a *non-collapsed* world head
+   helps the policy at our scale (the real E2 question). Then add seeds for error bars.
+3. Re-tune vicreg (raise invariance weight / lower `world_var_coeff`) so variance is target-aligned, not free.
