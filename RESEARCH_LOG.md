@@ -1827,3 +1827,100 @@ diversity, without which the same objective silently collapses).
 the released regime (EV→54 %) to see if the L2 gain grows with EV; longer-horizon / turn-subset L2; and
 eventually a closed-loop check. This closes the E2 line: the world objective is sound and *helps when it learns*;
 the open problem is making it learn reliably at smaller scale (→ the JEPA / normalized-target direction).
+
+#### Roadmap — chosen next steps
+
+Strategic framing first (so the order is justified): **collapse and the god-eye-BEV/external-DINOv3 issue are TWO
+DIFFERENT problems.** Collapse is a *training-dynamics* problem (trivial mean solution on low-diversity data;
+curable by diversity — proven — OR by an anti-collapse objective — untested). The god-eye top-down camera +
+frozen external DINOv3 is a *validity/realism* problem (privileged sim-only target, OOD non-adapting teacher).
+Solving one does not solve the other. Two facts drive the ordering:
+- **Anti-collapse is a PREREQUISITE for the JEPA upgrade, not an alternative.** The frozen-DINOv3 target is
+  collapse-proof *for free*; replacing it with an EMA in-domain teacher (JEPA) reintroduces collapse in a harder
+  form and *requires* exactly the VICReg / EMA+stop-grad+predictor machinery the A1/A2 arms prototype.
+- **The god-eye/sim-to-real benefit is unfalsifiable in this project** — Bench2Drive is CARLA for both training
+  AND closed-loop eval, so removing the god-eye target can't be *rewarded* here until real data (nuScenes/Waymo)
+  is in play.
+
+**Step 1 — Build a scale-invariant collapse meter (UNBLOCKER, cheap).** The current `probe_world_collapse.py`
+reads raw-MSE EV, which is *meaningless* for cosine/vicreg-trained heads (A1 read −26743 %). Add **cosine-EV**
+(1 − cos_loss / mean-direction baseline) and/or **cross-scene CKA** (scale/rotation-invariant), via an embedding
+dump of `vis_head` predictions + DINOv3 targets. Without this, every anti-collapse experiment below is
+unmeasurable, and JEPA targets later would be too.
+
+**Step 2 — Anti-collapse on the SAME structure (high ROI, reuses all infra).** Re-run / properly evaluate the
+A1 (cosine) and A2 (vicreg) arms on the LOW-diversity data (e2_FT, 211 scenes), judged with the Step-1 meter.
+Question: *can an objective change make the head escape collapse on small data — matching what 10k scenes (A3)
+bought?* Reference points already exist: e2_FT = collapsed (EV ~5 %), A3 = diversity-cured (EV 38 %). Bonus prior
+signal: A1 cosine already had the best small-data L2 (0.932). This directly builds the anti-collapse capability
+the JEPA step needs. Likely also re-tune VICReg coeffs (raise invariance vs `world_var_coeff`).
+
+**Step 3 — Structural upgrade: JEPA / remove the god-eye target (higher ceiling, bigger lift, do AFTER Step 2).**
+Per [WORLD_MODEL_JEPA.md](WORLD_MODEL_JEPA.md): replace the frozen external DINOv3 with an **EMA in-domain BEV
+encoder** as the teacher, and/or build the future-BEV target from **onboard surround cams (+ lidar)** instead of
+the CARLA `TOP_DOWN` render (privileged-lidar→camera distillation; or an occupancy/flow target). Gate this on:
+(a) Step 2's anti-collapse machinery working (de-risks the collapse-prone EMA teacher), and (b) ideally a
+real-data eval so the sim-to-real/realism benefit is actually measurable.
+
+**Do NOT** jump straight to removing the god-eye BEV: it inherits collapse in a harder (EMA) form before it's
+solved, and its realism payoff can't be demonstrated on a CARLA-only benchmark.
+
+---
+
+### 2026-06-26 — E2-4 A3 with a SECOND seed: collapse-cure is robust; the trajectory benefit is NOT
+
+Completed the A3 λ0/λ2 ablation at **two seeds** each (4 runs, same e2_4_A3 data/recipe). The seed-1 runs were
+killed mid-training and recovered from their **`checkpoint-900`** (consolidated to root + plots + test + collapse
+re-run separately) — see the caveat below.
+
+| run | world head | collapse `loss_gen` / EV | test L2 (1s / 2s / overall) |
+|---|---|---|---|
+| λ0 seed0 (`1782309767`) | OFF | 3.88 / **EV ≪0** → COLLAPSED | 0.433 / 0.929 / **0.681** |
+| λ0 seed1 (`1782385423`) | OFF | 4.79 / **EV ≪0** → COLLAPSED | 0.417 / 0.910 / **0.663** |
+| λ2 seed0 (`1782231563`) | ON  | 0.030 / **EV 37.7 %** → PARTIAL | 0.399 / 0.870 / **0.634** |
+| λ2 seed1 (`1782385098`) | ON  | 0.031 / **EV 37.1 %** → PARTIAL | 0.425 / 0.915 / **0.670** |
+
+**Finding 1 — the collapse cure is ROBUST.** λ2 reaches **EV ≈ 37 % on both seeds** (37.7 / 37.1 — essentially
+identical); λ0 stays collapsed/random on both (loss_gen ~4, EV ≪0, since its `vis_head` gets no gradient). So
+*diversity reliably un-collapses the world head* — the head learns real scene-specific DINOv3 structure
+reproducibly. **This is the solid, replicated result.**
+
+**Finding 2 — the world head's open-loop trajectory benefit does NOT replicate.** Paired per-sample L2
+(λ0−λ2, same 499 test samples, >0 ⇒ λ2 better):
+- **seed 0: Δ = +0.047, t = +2.59** (λ2 significantly better) — the 2026-06-25 result.
+- **seed 1: Δ = −0.002, t = −0.14** (no difference — a null, not a reversal).
+
+Arm means: **λ0 = 0.672** (0.681, 0.663) vs **λ2 = 0.652** (0.634, 0.670) → λ2 better by **0.020** on average,
+but **driven entirely by seed 0**. The **between-seed spread (λ2 = 0.036) exceeds the mean effect (0.020)**, so
+the benefit is **within run-to-run noise** — it appears in one seed and vanishes in the other.
+
+**Revised conclusion (supersedes the single-seed 2026-06-25 claim).**
+- *Reproducible:* with enough scene diversity the DINOv3 world objective **reliably learns** (escapes the
+  per-dim-mean collapse, EV ~37 % both seeds). World modeling is a working representation-learning signal here.
+- *Not reproducible:* that learned head giving a **measurable open-loop L2 improvement** to the trajectory. With
+  2 seeds it's **inconclusive / not significant** — significant in one seed, absent in the other. The honest
+  verdict downgrades from "the world head helps the policy" to **"the head learns reliably; whether it helps the
+  open-loop trajectory at this scale is within noise."**
+
+**Caveats (why this isn't the final word).**
+1. **Seed-1 runs are `checkpoint-900` snapshots of *killed* runs**, not `load_best_model_at_end` completed
+   models. λ0-seed1 especially sits at step 900, while λ0-seed0's *best* was ~step 600 — so the seed-1
+   comparison isn't perfectly apples-to-apples. A clean **resume-to-early-stop** of both seed-1 runs (the
+   resumable DeepSpeed state is intact) would settle it.
+2. **Open-loop L2 is the least sensitive axis** (the paper's effect is closed-loop +26 DS). A small,
+   seed-inconsistent open-loop signal is exactly what a real-but-weak effect would look like on a metric that
+   can't resolve it — so this is *not* evidence the world head is useless, only that open-loop L2 can't reliably
+   detect its benefit at this scale.
+
+**Implication for the roadmap.** This *strengthens* the case for the planned next steps: the current
+frozen-DINOv3 objective learns but its policy payoff is marginal/noisy in open-loop, which is more reason to
+(a) get a **scale-invariant collapse meter** and a **more sensitive eval** (turn-subset / longer-horizon /
+closed-loop), and (b) pursue a **stronger world target** (A1/A2 objective fixes, then JEPA) that might yield a
+larger, more reliable downstream effect. The 2-seed result here is the error-bar reality check that the
+2026-06-25 single-seed conclusion explicitly asked for.
+
+**Data-recovery procedure used (for reference).** Both killed seed-1 runs were completed *without* retraining:
+copy the HF model (`model-*.safetensors` + config + tokenizer) from `checkpoint-900` → run-dir root; regenerate
+the 4 loss plots from `run.log`/`trainer_log.jsonl` (`scripts/plot_losses.py` + `llamafactory…plot_loss`); then
+run the test-set L2 (`infer_local_multi_gpu --test`) and `probe_world_collapse.py` on the root model. Result:
+the dirs match completed runs (model + `test.log`/`test_plots`/`test_infer.json` + `collapse.log` + 4 plots).
