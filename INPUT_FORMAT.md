@@ -386,3 +386,83 @@ Note the **answer emits both**: `future pixel tokens` (discrete, BEV) *and*
 `future waypoints` (continuous, metres) — a dual encoding (FSDrive-style). The
 **waypoints in metres** are what's used downstream (L2 eval + PID control); the pixel
 tokens ground the same path in the BEV-image / world-model space.
+
+### Q — Is the training loss `loss_rec` the same as the eval **L2**? What does `loss_rec` actually average over?
+**No — different quantities on different scales** (not two implementations of one thing).
+
+**First, the forward step — how `logits` arise (hidden → head).** The 36 causal layers output
+`hidden (1, L, 2048)`; then `hidden → final RMSNorm → lm_head (2048→153536)` produces
+`logits (1, L, 153536)` — a next-token distribution at *every* position (the text/“language” head). In
+parallel, the `<|bev_token|>` rows' 2048-vectors go `→ vis_head (2048→1024)` (the world head, §7). One hidden
+matrix, two projection heads. **Training runs this in ONE parallel pass, not a token-by-token loop**: the
+causal mask alone enforces the autoregressive conditioning (`logits[i]` sees only tokens `0..i`, so it predicts
+`x_{i+1}`), and because the whole GT answer is available, all `L` next-token CEs are computed at once.
+**Teacher forcing** = during training the model is fed the *ground-truth* previous tokens (never its own
+predictions), which is exactly what makes that single parallel pass possible; its cost is the train/inference
+“exposure bias” gap (at test time the model must instead consume its own outputs — see the inference Q below).
+
+| | `loss_rec` (training) | **L2** (open-loop eval) |
+|---|---|---|
+| what | token **cross-entropy** (next-token) | **Euclidean distance** between predicted & GT waypoints |
+| mode | **teacher-forced**, all positions in ONE parallel pass (GT fed in) | **autoregressive generation**, then decode + regex-parse |
+| operates on | `lm_head` logits `(L, 153536)` → `−log p(correct next token)` | parsed `(x,y)` waypoint floats |
+| where | `self.loss_function(logits, labels, …)` ([modeling_qwen2_5_vl.py:1540](src/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py#L1540)) | `cal_l2_loss`/`parse_answer` ([eval_and_visual_local.py](src/tools/eval_and_visual_local.py)), via [eval_l2.py](src/tools/eval_l2.py) |
+| unit | nats / token | metres |
+
+**What `loss_rec` averages over — NOT all ~4540.** Logits exist at every position, but the CE is **masked**
+(`labels = -100`) everywhere except the assistant **answer text** tokens. The 1305 `<|bev_token|>` are masked
+too — they are supervised by the world loss (`loss_gen`/`vis_head`, §7), not the text CE. So for a no-CoT
+sample `loss_rec` averages over only **~75 tokens**: `<think>None.</think>` (~4) + the pixel-token block
+(~23: template + the **8** `<|pixel_token_N|>`) + the waypoint block (~48: template + the **digit tokens** of
+the 4 `(x,y)`); with a real CoT, ~125–225. It is **dominated by easy template tokens**, so a small `loss_rec`
+change maps only loosely to trajectory error — which is why the *policy* is judged by **L2 in metres**, not by
+`loss_rec`. (Two L2 caveats: the eval "1s/2s" are ADE *up to* that horizon, not point-at-time, so our ~1.0 is
+not directly comparable to the paper's 0.58; and any λ-ablation uses the same calculator on both arms, so the
+*relative* comparison is robust regardless.)
+
+**Why labels are shifted by one.** At position `i` the model has *already been given* `x_i` (the causal mask
+includes `i`), so "predicting `x_i`" is trivial copying — it must predict the **unseen next** token `x_{i+1}`.
+Aligning `logits[i] ↔ x_{i+1}` is the one-position shift (`logits[:, :-1]` vs `labels[:, 1:]`).
+
+**What is back-propagated:** `loss = loss_rec + world_loss_weight · loss_gen`. **The L2 is NOT in the loss**
+(eval-only, non-differentiable through token sampling + regex parse). The trajectory is learned **purely as
+text**, via the CE on the waypoint digit tokens inside `loss_rec` — there is no separate trajectory/L2 head.
+
+**Ground truth = the `role:"assistant"` message:** the text (CoT + pixel tokens + waypoint digits) is the
+`loss_rec` target; the 1305 bev tokens' GT is DINOv3 features of the future-BEV images (`loss_gen`). The
+`role:"user"` turn is **context, fully masked** (`-100`). ⚠ Don't confuse the prompt's *target* pixel tokens
+(an input goal) with the assistant's *future* pixel tokens (the GT to produce).
+
+### Q — How is the `(4540, 2048)` hidden state used "sequentially" at inference? And do test files' GT get used by the model?
+**Training is parallel** (the whole GT answer is fed → teacher forcing → all next-token CEs in one pass).
+**Inference has no GT**, so it is sequential — and the key point: **only the *last* row of the hidden state
+predicts the next token** (recall `logits[i]` predicts token `i+1`). The `(4540, 2048)` is *not* "used
+sequentially"; the sequence grows one row at a time and each step projects only the newest row:
+
+1. **Prefill — one parallel pass** over prompt + 10 images + 1305 bev (= the **4540** input rows):
+   `input_ids (1,4540)` → `inputs_embeds (1,4540,2048)` (embed + scatter, §3) → 36 causal layers →
+   `hidden (1,4540,2048)`; **cache K/V for all 4540.** Use only `hidden[:, -1, :] (1,2048)` → `lm_head` →
+   `logits (1,153536)` → sample the **first** answer token. (Rows 0..4538 aren't projected for generation —
+   their logits would just re-predict prompt tokens; they only serve as cached attention context.)
+2. **Decode loop — sequential**, until `</answer>`/EOS (or `max_new_tokens`): feed the 1 new token `(1,1)` →
+   `embed (1,1,2048)` → causal layers **using the KV cache** (the new token attends to all cached past) →
+   one new row `hidden (1,1,2048)` → `lm_head` → `logits (1,153536)` → next token → append → repeat.
+
+So generation repeats **~75 times** (the *answer* length), **not** 4540: the ~4540 prompt/bev rows are
+prefilled once; only the answer is generated. The final full sequence (~4540 + ~75 ≈ 4615) matches training's
+length, but the autoregressive part is just the answer. The **KV cache** is what makes each decode step cost
+~one token instead of re-forming the `4540×4540` square (§8). ("Concatenate → projector", by shape:
+*concatenate* = build the fused `inputs_embeds (1,L,2048)` (§3/§4); *projector* = `lm_head : (·,2048)→(·,153536)`
+— training applies it to all L rows at once, inference to one row per step.)
+
+**Do test files contain the GT? Yes — but the model never sees it; only the scorer does.** `infer_local.py`
+builds the model input from `messages[0]` (user) **only** — the assistant turn is commented out
+([infer_local.py:71](src/infer_local.py#L71)) — generates from the prompt, and stores `messages[1]` separately
+as `gt` ([:89](src/infer_local.py#L89)) so `eval_l2` can compare `pred` vs `gt`. The GT rides along with the
+sample purely as the answer key for the L2 metric.
+
+| split | file | GT **fed to the model**? | GT used for |
+|---|---|---|---|
+| **train** | `train.jsonl` | **yes** — teacher-forced (input *and* target) | back-propagated CE (`loss_rec`) + world MSE (`loss_gen`) |
+| **eval** (during training) | `eval.jsonl` | **yes** — teacher-forced forward | `eval_loss` (CE), no backprop → early-stopping signal |
+| **test** (final L2) | `test.jsonl` | **no** — generated from the prompt only | only the **scorer** (parse GT waypoints → L2 vs `pred`) |
