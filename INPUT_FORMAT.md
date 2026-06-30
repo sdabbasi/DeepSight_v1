@@ -387,6 +387,35 @@ Note the **answer emits both**: `future pixel tokens` (discrete, BEV) *and*
 **waypoints in metres** are what's used downstream (L2 eval + PID control); the pixel
 tokens ground the same path in the BEV-image / world-model space.
 
+### Q — Are the assistant's *future pixel tokens* and *future waypoints* the same thing? Is one "coarse" and the other "fine"?
+**Yes — they are the *same predicted path*, emitted twice in two encodings.** Not two
+different plans, and not different horizons: both are the **same 4 points at 0.5 s
+intervals over the next 2 s** (the answer carries 4 future pixel points × 2 = **8**
+`<|pixel_token_N|>`, and the **4** `(x,y)` waypoints — the same four timesteps). They
+differ only in **precision** and **coordinate space**:
+
+| | future **pixel tokens** | future **waypoints** |
+|---|---|---|
+| same 4-point, 2 s path? | ✔ | ✔ |
+| coordinate space | BEV **image grid** (cells) | **metric metres**, ego frame |
+| precision | **coarse** — quantized to ±255 cells (~2 px/cell) | **fine** — continuous, arbitrary precision |
+| token mechanism | learnable `<\|pixel_token_N\|>` vocab | ordinary **digit text** (`"2"`,`"."`,`"8"`…) |
+| role downstream | **grounding** — ties the path to the BEV scene + world-model `<\|bev_token\|>` latents | **the real output** — PID control + the L2 metric run on these |
+
+The common "coarse vs fine" reading is **right for precision**, but mind two traps:
+1. **Not "big picture vs detail."** Same horizon, same timesteps — only precision/space
+   differ. The "big-picture, long-range, ~10 m-spaced" description belongs to the
+   **target** route pixels (the input goal), **not** the **future** pixels; the future
+   pixels are short-2 s and only *spatially* coarse because of the grid quantization.
+2. **Waypoints are *not* "fine pixel tokens."** They are a different representation
+   entirely — metric metres written as plain numbers — **not** a higher-resolution pixel
+   grid and **not** the `<|pixel_token_N|>` vocabulary at all. Better phrasing:
+   *"the same path in fine metric units."*
+
+Why emit both (FSDrive-style dual encoding): the **pixel** form keeps the plan in the
+same BEV-image space as the world-model latents (visual grounding); the **metric** form
+is the physically-actionable trajectory the controller drives and L2 scores.
+
 ### Q — Is the training loss `loss_rec` the same as the eval **L2**? What does `loss_rec` actually average over?
 **No — different quantities on different scales** (not two implementations of one thing).
 
@@ -466,3 +495,88 @@ sample purely as the answer key for the L2 metric.
 | **train** | `train.jsonl` | **yes** — teacher-forced (input *and* target) | back-propagated CE (`loss_rec`) + world MSE (`loss_gen`) |
 | **eval** (during training) | `eval.jsonl` | **yes** — teacher-forced forward | `eval_loss` (CE), no backprop → early-stopping signal |
 | **test** (final L2) | `test.jsonl` | **no** — generated from the prompt only | only the **scorer** (parse GT waypoints → L2 vs `pred`) |
+
+---
+
+## 11. The on-disk sharegpt sample (train / eval / test are one identical format)
+
+§1–§9 dissected the *runtime inference input* (prompt-only, prefilled). This section shows the
+**raw on-disk row** as it actually sits in `train.jsonl` / `eval.jsonl` / `test.jsonl` — i.e. the
+full sharegpt sample **including the assistant turn and the 5 BEV target images**. One representative
+row (a line of `local_data/e2_4_A3/eval.jsonl`, abbreviated; the others are byte-for-byte the same
+*shape*):
+
+```jsonc
+{
+  "messages": [
+    { "role": "user", "content":
+        "These are the vehicle's CAM_FRONT historical images: 2.0s ago <image> … 0.5s ago <image>.
+         These are the … six-view images: CAM_FRONT:<image> … CAM_BACK_RIGHT:<image>.
+         These are the target pixel tokens: [(<|pixel_token_-11|>,<|pixel_token_0|>), … ]   // ROUTE goal (input)
+         Historical trajectory: [(-5.96,0.00), … ] current speed info: speed: 5.16, acceleration: 3.81
+         <CoT_flag_False>
+         Based on the provided particulars, please generate BEV image and plan waypoints …" },
+    { "role": "assistant", "content":
+        "<|start_bev_token|><|bev_token_0|> … <|bev_token_1304|><|end_bev_token|>   // 1305 world queries
+         <think>None.</think>                                                        // CoT (here empty)
+         <answer> These are the future pixel tokens: [(<|pixel_token_16|>,<|pixel_token_0|>), … ]. </answer>
+         <answer> These are the future waypoints: [(2.82,0.00),(5.73,0.00),(9.57,0.00),(13.40,0.00)]. </answer>" }
+  ],
+  "images": [
+    ".../rgb_front/00000.jpg", ".../00005.jpg", ".../00010.jpg", ".../00015.jpg",  // [0:4]  4 history front
+    ".../rgb_front/00020.jpg", ".../rgb_front_left/00020.jpg", … ".../rgb_back_right/00020.jpg", // [4:10] 6 surround
+    ".../rgb_bev_0th-hz/00020.jpg", … ".../rgb_bev_20th-hz/00020.jpg"              // [10:15] 5 FUTURE-BEV targets
+  ],
+  "_scene": "TJunction_Town06_Route306_Weather20", "_frame": 20                     // provenance, ignored by the model
+}
+```
+
+**The fields.** `messages[0]` (user) = the context dissected in §1–§9 (10 `<image>` markers → `images[0:10]`,
+the *target* route pixel tokens, history, speed). `messages[1]` (assistant) = the **ground truth**: the 1305
+`<|bev_token|>` block, the CoT, and the two `<answer>` lines (*future* pixel tokens + *future* waypoints).
+`images[10:15]` = the 5 `rgb_bev_*` future top-down frames — the **DINOv3 targets** for the world loss, and the
+**only images that are not referenced by an `<image>` marker** (10 markers, 15 images). `_scene`/`_frame` are
+build-time provenance, never tokenized.
+
+### ⚠ This on-disk row is the *training* format — it is NOT the model's inference input
+
+A common confusion: this full `user + assistant` block is **the training sample**, not "the prompt the model
+reads." The two turns play different roles, and **what is actually fed differs by mode** — so the *training
+input* and the *inference input* are **not identical**:
+
+- **Training / eval forward:** **both** turns are fed in one parallel pass (**teacher forcing**) — `messages[0]`
+  (user) as **masked context** (`-100`, no loss), `messages[1]` (assistant) as the **supervised target** (text
+  CE + world MSE on the bev block). Training *does* see the assistant turn — but as the **label**, not as a
+  prompt the model "reads and continues."
+- **Inference / test:** the model is fed **only `messages[0]` + the prefilled BEV block**
+  (`<|start_bev_token|> <|bev_token_*|> <|end_bev_token|>`) and **generates** the assistant answer
+  (`<think>…</think>`, future pixel tokens, future waypoints) token-by-token (§10's "sequential" Q). The
+  assistant's `<think>`/`<answer>` text is **never in the input**.
+
+So **training-format ≠ inference-input**: the §11 row is the whole conversation (prompt **+** answer); the
+inference input is the **user turn only**, plus the constant prefilled bev queries. (Subtlety: the 1305
+`<|bev_token|>` *are* prefilled at decode time — they're fixed query slots, not generated — but everything
+inside the two `<answer>` blocks is **produced**, not fed.) ⚠ And, as in §10: don't conflate the user turn's
+*target* pixel tokens (an input goal) with the assistant turn's *future* pixel tokens (the GT/output) — same
+token type, opposite role.
+
+### The same row, consumed three different ways
+
+The file content is identical across splits; the **split decides which parts are read** (this is the actionable
+expansion of §10's last table):
+
+| Part of the row | **train** (`train.jsonl`) | **eval** (`eval.jsonl`, during training) | **test** (`test.jsonl`, final L2) |
+|---|---|---|---|
+| `messages[0]` user prompt | fed as context, **masked** (`-100`) | same — fed, masked | fed — **the only thing the model sees** |
+| `images[0:10]` (10 cameras) | ViT → scattered into image slots (§3) | same | same |
+| `messages[1]` **text** (`<think>`, future pixel tokens, waypoint digits) | **teacher-forced** input *and* CE target → `loss_rec` (backprop) | teacher-forced forward → contributes to `eval_loss` (**no** backprop) | **held out** — never fed; kept only as the answer key |
+| `messages[1]` 1305 `<\|bev_token\|>` + `images[10:15]` (5 BEV) | bev outputs → `vis_head` → MSE vs DINOv3(BEV) → `loss_gen` (backprop) | same forward → world term of `eval_loss` | **not used** — BEV images not loaded; bev tokens prefilled but `vis_head` not applied (no world loss at decode) |
+| what comes out | `loss = loss_rec + λ·loss_gen`, **back-propagated** | scalar `eval_loss` → early-stopping / best-model signal, **no** update | model **generates** the answer autoregressively; scorer regex-parses GT waypoints from `messages[1]` → **L2 in metres** |
+| mode | parallel, teacher-forced | parallel, teacher-forced | autoregressive generation (no teacher forcing) |
+
+**One-line summary.** *Train* uses **every** part (prompt + cameras as input; assistant text + bev/DINOv3 as
+supervised targets, with gradients). *Eval* runs the **identical forward** but only to read off `eval_loss` (no
+gradient) for early stopping. *Test* feeds **only** `messages[0]`, generates, and uses `messages[1]` solely as
+the off-model answer key for L2 — so at test the assistant turn and the 5 BEV target images are never seen by the
+network. The structural sameness is deliberate: it lets one builder emit all three splits, and lets a λ-ablation
+reuse the exact same rows so train/eval/test differ only in *consumption*, not in *content*.
