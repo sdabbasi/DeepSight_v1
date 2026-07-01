@@ -3,8 +3,7 @@
 > Companion docs: [CLAUDE.md](CLAUDE.md) (repo guide), [SRC_CODE_MAP.md](SRC_CODE_MAP.md)
 > (paper↔code), [INPUT_FORMAT.md](INPUT_FORMAT.md) (token formats),
 > [WORLD_MODEL_JEPA.md](WORLD_MODEL_JEPA.md) (world-model critique → JEPA),
-> [RUN_LOCAL_INFERENCE.md](RUN_LOCAL_INFERENCE.md) / [RUN_LOCAL_TRAINING.md](RUN_LOCAL_TRAINING.md)
-> (runbooks).
+> [RUN_LOCAL.md](RUN_LOCAL.md) (local train/inference runbook).
 
 ---
 
@@ -208,7 +207,7 @@ what the JEPA redesign targets.
   (every rank aborted at import). Fixed with `pip install 'deepspeed==0.16.9'`. 4-GPU
   ZeRO-2 step verified (cross-GPU grad sync OK).
 - **Configs.** `ad_bev_train_smoke.yaml` (1 GPU, `max_steps=1`) and
-  `ad_bev_train_local.yaml` (multi-GPU, ZeRO-2, 2 epochs). Runbook: `RUN_LOCAL_TRAINING.md`.
+  `ad_bev_train_local.yaml` (multi-GPU, ZeRO-2, 2 epochs). Runbook: `RUN_LOCAL.md`.
 
 ### Conceptual analysis
 
@@ -502,7 +501,7 @@ to interoperate end-to-end and the repo is trustworthy enough to start the JEPA 
   no effect on results). Verified the eval gate: the blocking `p.wait()` loop waits for
   **all** shards (total time = the slowest worker) and a failed shard aborts the merge — so
   `eval_l2.py` runs exactly once, on the complete merged output.
-- Documented both inference forms in `RUN_LOCAL_INFERENCE.md` (single manual commands kept;
+- Documented both inference forms in `RUN_LOCAL.md` (single manual commands kept;
   the one-shot automatic command added) with a "reproduce open-loop ≈0.58" recipe that
   encodes today's intent: favor scenario diversity over frame density via a coarse stride.
 
@@ -659,7 +658,7 @@ Hardened the E-experiment training harness (no original repo files touched):
   `loss/loss_rec/loss_gen` prints from `run.log` → `losses_split.png` (three descending
   curves, log-y) — recovering the rec/gen split the trainer doesn't log, without editing the
   model/trainer.
-- **General multi-GPU** documented in [RUN_LOCAL_TRAINING.md](RUN_LOCAL_TRAINING.md) (Step 3):
+- **General multi-GPU** documented in [RUN_LOCAL.md](RUN_LOCAL.md) (Step 3):
   any config on N GPUs via `CUDA_VISIBLE_DEVICES=<list> FORCE_TORCHRUN=1 scripts/train.sh
   <config>` (CLI auto-launches torchrun→DDP; DeepSpeed optional). So E1 on 2 GPUs is just the
   general pattern applied to `configs/ad_bev_overfit.yaml`.
@@ -2234,3 +2233,77 @@ single-route smoke (`smoke_test_town03.xml`) → Phase 4 parallel 220 → Phase 
 **"need a checkpoint from the user"** item is now satisfied: the **A4 λ2 (HEALTHY) and λ0 control** checkpoints
 are the first eval targets (per the closed-loop direction note above). See [CARLA.md](CARLA.md) for the exact
 launch commands, the `-graphicsadapter` mapping, and the parallel-launch template.
+
+### 2026-06-30 — closed-loop eval TOOLING finished + first smoke run; cold-start deadlock finding; docs/cleanup
+
+Continues the 2026-06-29 CARLA entries (which cover Phases 0–1 — server renders, env built). Today: finished the
+run tooling, did the first end-to-end closed-loop run, hit an important checkpoint-behaviour finding, and did repo
+housekeeping + docs.
+
+**Enablement / tooling.**
+- **Released model staged as a regular exp** — copied `checkpoints/deepsight` → `saves/deepsight/original_deepsight`
+  (run-dir-root layout), so it's evaluable like any trained run.
+- **`saves/` cleanup** — confirmed the "final model lives at the run-dir root" convention holds for every exp, then
+  deleted the redundant intermediate `checkpoint-XXXX/` dirs across 6 exps → **~1.3 TB freed** (each root model
+  verified complete first).
+- **Runbooks merged** — `RUN_LOCAL_TRAINING.md` + `RUN_LOCAL_INFERENCE.md` → single **`RUN_LOCAL.md`**; deleted the
+  originals and repointed all references (RESEARCH_LOG, configs, `requirements.txt`).
+- **Closed-loop runner writes under the model's own exp dir** — `scripts/run_carla_closed_loop.sh` (renamed from
+  `run_carla_smoke.sh`) → `<run_dir>/closed_loop/<routes>.{json,log}` + `_summary.txt` + `_viz/`; added
+  **`scripts/carla_score.py`** (DS/SR/RC aggregated from per-route `records[]`, since `global_record` is empty on
+  RESUME runs); documented as **RUN_LOCAL.md §4**.
+- **Server/eval decoupled** — patched `leaderboard_evaluator.py` with **`CARLA_NO_LAUNCH`** (connect to an existing
+  server vs spawn+atexit-kill one) + added **`start_carla.sh`/`stop_carla.sh`**, so killing the eval no longer
+  orphans CARLA and reruns skip the ~60 s boot.
+- **Bugs fixed** — relative-`CKPT` path (the evaluator runs with cwd=`bench2drive/`, so output paths must be
+  absolutized); `start_carla.sh` couldn't write a `carla`-owned log because **this container's root lacks
+  `CAP_DAC_OVERRIDE`** (fix: `carla` owns the log dir + redirect *inside* the `su`). Server boot verified.
+
+**First closed-loop smoke run (released model, 1 route Town03): DS = 100, SR = 100%.** ⚠ Not a benchmark number —
+one short straight route. Confirmed `RESUME=True` semantics: resume skips only *completed* routes, so a single
+interrupted route is re-driven from the start (route granularity, no mid-route resume).
+
+**Finding — the A4 λ2 checkpoint DEADLOCKS in closed-loop despite acceptable open-loop L2.** Fed the at-rest cold
+start (`speed 0`, zero history) it emits **all-zero waypoints `[(0,0)×4]`** every tick → the car never moves → the
+same input recurs → permanent deadlock. **CORRECTED causal framing (user caught the earlier imprecision):** this
+is a *capability* gap, **not** a cold-start-regime gap. The paper trains open-loop and evals closed-loop *too*, so
+the released model meets the **identical** cold start — and at the byte-for-byte same input (`speed 0`, history
+`(0,0)`) it predicts **forward** motion `[(0.78,0),(2.93,-0.08),…]` and drives off, whereas A4 predicts `(0,0)`.
+Cold-start is faced by BOTH and is learnable from open-loop data (every route begins at rest); A4 (small strided
+`e2_lora` subset, undertrained ablation arm) just learned the dominant *"speed 0 ⇒ stay stopped"* association
+(red-light / traffic / yield waits dominate the at-rest frames) and can't discriminate the *"cold start ⇒ go"* case
+from scene context. **Closed-loop is only the TRAP, not the cause:** open-loop resets the input to GT every frame
+so A4's at-rest misprediction never persists (masked in the L2 average over mostly-moving frames); closed-loop
+feeds `(0,0)` back so the car stays at rest and A4 stays in its weak regime forever. The real open-loop↔closed-loop
+asymmetry is therefore **error *persistence*, not a novel regime**. Aggravated by a **`CoT_flag` mismatch**: the
+closed-loop agent hardcodes `<CoT_flag_True>`
+([qwen_b2d_agent.py:92](bench2drive/team_code/qwen_b2d_agent.py#L92)) but A4 was trained / open-loop-tested with
+`<CoT_flag_False>` (it emits `<think>None.</think>`) → an OOD flag; the released model was trained *with* CoT and
+drives. **Takeaway: open-loop L2 does not predict closed-loop drivability** (the open-loop↔closed-loop gap) —
+directly reinforces the 2026-06-29 decision that closed-loop is the decisive metric for the world-head claim.
+
+**Docs / analysis.**
+- Explained the eval visualization: `closed_loop/…_viz/bev/` (annotated) vs `camera/CAM_BEV/` (raw top-down camera
+  sensor, z=50 m pitch −90°); the cyan dots = the **target route points** overlaid via `draw_traj_bev`; the blue
+  tint + cyan is a BGR↔RGB channel-swap (`cv2` array saved through PIL), harmless.
+- **INPUT_FORMAT.md** — new §10 Q (future *pixel tokens* vs future *waypoints* = the **same** 2 s / 4-point path,
+  coarse BEV-grid vs fine metric; waypoints are *not* "fine pixel tokens") and §11 note (the on-disk user+assistant
+  row is the **training** format; inference feeds only the user turn + the prefilled bev block and *generates* the
+  answer — training-input ≠ inference-input).
+- **CARLA.md** — closed-loop **speed** section: bottleneck is the per-tick `generate(max_new_tokens=15000)` at
+  10 Hz; ranked fixes (re-plan every N ticks, cut `max_new_tokens`, flash-attn, local-disk `SAVE_PATH`, separate
+  GPUs, vLLM, parallelize).
+
+**Next — confirm the diagnosis cheaply (open-loop, no closed-loop / GPU-heavy run needed), then unblock the ablation.**
+1. **Open-loop at-rest probe.** Feed A4 the actual **first frames of a route** (speed ≈ 0, at rest) via
+   `src/infer_local.py`, once with `<CoT_flag_False>` and once with `<CoT_flag_True>`. Decision rule:
+   - A4 predicts `(0,0)` there too → confirms the **at-rest capability gap** (closed-loop merely *traps* it, doesn't
+     cause it); the fix is a better/broader-trained policy, not a closed-loop tweak.
+   - A4 predicts forward motion open-loop-at-rest but `(0,0)` in closed-loop → the **agent's prompt construction
+     diverges from training** (a real OOD bug in `qwen_b2d_agent.py`) — chase that instead.
+   - The two flag settings isolate the **`CoT_flag`** contribution (agent hardcodes `True`; A4 trained on `False`).
+2. **Unblock, then run the ablation.** The world-head closed-loop ablation (A4 λ2 HEALTHY vs λ0 control) is only
+   readable once **both arms can actually drive** — match the training flag (`<CoT_flag_False>` in the agent) and/or
+   use policies competent enough to initiate motion (paper-scale-ish data). Otherwise both arms just deadlock and
+   the comparison is uninformative. **A4 as-is is not a competent enough policy for closed-loop.**
+3. Then Phase 4 parallel-220 + Phase 5 metrics.
