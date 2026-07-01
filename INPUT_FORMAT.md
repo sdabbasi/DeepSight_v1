@@ -580,3 +580,87 @@ gradient) for early stopping. *Test* feeds **only** `messages[0]`, generates, an
 the off-model answer key for L2 — so at test the assistant turn and the 5 BEV target images are never seen by the
 network. The structural sameness is deliberate: it lets one builder emit all three splits, and lets a λ-ablation
 reuse the exact same rows so train/eval/test differ only in *consumption*, not in *content*.
+
+---
+
+## 12. Adaptive CoT — how `<think>` enters training (and what real ones look like)
+
+§10–§11 used the no-CoT case (`<CoT_flag_False>` ⇄ `<think>None.</think>`). This section documents the **CoT
+variant**, verified against the real 100k corpus (`local_data/train_full_1223_100k.jsonl`) and the builder code
+([targetpointgen.py:227-260](bench2drive/dataprocess/targetpointgen.py#L227) `get_prompt`/`get_answer`).
+
+### It is NOT a separate stage — CoT is end-to-end, inside the same `loss_rec`
+
+There is **no second training phase** for reasoning. The `<think>…</think>` is just **ordinary assistant text**,
+emitted in the *same* single forward pass and supervised by the *same* next-token CE (`loss_rec`, §10) as the
+pixel/waypoint tokens. Nothing else moves: the world head (`loss_gen`/`vis_head`), the 1305 bev block, the
+collator masking, and `loss = loss_rec + λ·loss_gen` are all unchanged. Turning CoT on simply **adds more
+unmasked text tokens** to the existing `loss_rec` — the ~75-token no-CoT answer (§10) grows to **~125–225**
+tokens when a real rationale is present. `<think>` is already unmasked (it is assistant content, not a
+bev/image token), so `ad_collator.py` needs no change.
+
+### The flag ⇄ think pairing (set at build time)
+
+Two coupled edits vs. the no-CoT sample — **one token in the user turn, one block in the assistant turn**:
+
+| turn | no-CoT (§11) | CoT-on |
+|---|---|---|
+| **user** (between speed line & instruction) | `<CoT_flag_False>` | `<CoT_flag_True>` |
+| **assistant** (between the bev block & the `<answer>` lines) | `<think>None.</think>` | `<think>easy.</think>` **or** `<think>Hard.{summary}.</think>` |
+
+The flag is a **single control token** ([targetpointgen.py:230](bench2drive/dataprocess/targetpointgen.py#L230),
+`instruct_promt1 = f"<CoT_flag_{FLAGE}>"`). It teaches the model *when* to reason. At closed-loop inference the
+agent hard-codes it ON ([qwen_b2d_agent.py:92](bench2drive/team_code/qwen_b2d_agent.py#L92),
+`instruct_promt1 = "<CoT_flag_True>"`), and the model then **generates** the `<think>…</think>` autoregressively
+before the answer (part of the decode loop, never fed in — §10). ⚠ If you train with CoT, flip your infer/eval
+builder to `<CoT_flag_True>` too — [build_local_infer_jsonl.py:24](src/tools/build_local_infer_jsonl.py#L24)
+currently forces the `False`/`None.` path, so that one line is what gates whether you ever trigger the capability.
+
+### Three think forms = the "adaptive" in adaptive-CoT
+
+The `<think>` content is one of exactly three shapes, driven by an **offline scene-complexity judgment**
+(the `decision` + Chinese `summary` come from the Qwen3-VL annotation pass, `jsonopenai.py`);
+[targetpointgen.py:240-260](bench2drive/dataprocess/targetpointgen.py#L240) `get_answer`:
+
+| case | `<think>` content | builder branch | freq* |
+|---|---|---|---|
+| complex scene | `Hard.{summary}.` — real reasoning injecting external/social knowledge | `decision=='是复杂场景'` | ~17% |
+| simple scene | `easy.` — a content-free stub, no reasoning | `decision=='是简单场景'` | ~21% |
+| CoT off | `None.` | `FLAGE=='False'` | ~62% |
+
+\*measured on a 2000-line sample of the 100k file: **62% `<CoT_flag_False>` → all `None.`**; **38%
+`<CoT_flag_True>`**, splitting ~343 `Hard.` vs ~427 `easy.`. So the flag and the form are paired — `flag_False`
+always yields `None.`, `flag_True` yields `easy.`/`Hard.…`. Reasoning is spent only on long-tail scenes; the
+majority stay terse, which is the paper's *adaptive* CoT.
+
+### Real `<think>` samples (as they sit on-disk)
+
+The corpus rationales are **Chinese**; English glosses are added here for readability (the network only ever
+sees whatever text is inside the tags — language is a data choice, not a mechanism):
+
+```
+<think>easy.</think>
+```
+
+```
+<think>Hard.由于前方有“ACCIDENT AHEAD”警示牌且夜间路面湿滑，存在潜在事故风险，保持当前车道, 减速.</think>
+<think>Hard. Due to an "ACCIDENT AHEAD" warning sign and wet road conditions at night, there is a potential risk of accidents; maintain your current lane and slow down.</think>
+```
+
+```
+<think>Hard.由于右侧存在警车且其警示灯闪烁，可能存在紧急任务或交通管制，需谨慎处理多目标交互风险，保持当前车道, 减速.</think>
+<think>Hard. Due to the presence of a police vehicle with flashing warning lights on the right—indicating a potential emergency mission or traffic control—exercise caution regarding multi-object interaction risks, maintain the current lane, and slow down.</think>
+```
+
+Note the recurring `Hard.` prefix + a trailing action clause (`保持当前车道, 减速.` = "keep current lane, slow
+down") — the rationale is a compact *cause → caution → action* string, not free-form prose.
+
+### Recipe (keep your existing builder; change two strings)
+
+1. **user turn:** `<CoT_flag_False>` → `<CoT_flag_True>`.
+2. **assistant turn:** `<think>None.</think>` → `<think>easy.</think>` or `<think>Hard.{reasoning}.</think>`.
+
+Everything else — bev block, target/future pixel tokens, future waypoints, the 15 images, masking, both losses —
+is byte-for-byte identical to the no-CoT rows (§11). The **only new ingredient** is the `decision` + `{reasoning}`
+string, sourced from the offline VLM annotation step; the training machinery is indifferent to what sits inside
+`<think>`.

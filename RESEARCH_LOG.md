@@ -2401,3 +2401,12 @@ held-out L2 + variance-check meter into the run dir).
    the pass/fail signal is whether the **STAY-rate collapses** from A4's 98.5 % toward GT's ~2.5 %.
 3. If motion initiates, take A3_2 to **closed-loop** (the decisive metric) — matching the training `<CoT_flag_False>`
    in the agent first.
+
+### 2026-07-01 (cont.) — adaptive-CoT data path documented (from the real 100k corpus)
+
+Investigated how the paper's `<think>` CoT actually enters training, verified against `train_full_1223_100k.jsonl`
+and the builder (`targetpointgen.py get_prompt`/`get_answer`). Key finding: CoT is **end-to-end, not a separate
+stage** — `<think>…</think>` is ordinary assistant text under the same `loss_rec` CE; only two strings change per
+sample (`<CoT_flag_True>` in the user turn ⇄ one of `Hard.{summary}.` / `easy.` / `None.` in the assistant turn),
+driven by an offline Qwen3-VL complexity judgment (~38% flag-True in the corpus; rationales are Chinese). Full
+write-up + real `<think>` samples added as **§12 of [INPUT_FORMAT.md](INPUT_FORMAT.md)**.
