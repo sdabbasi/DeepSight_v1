@@ -2307,3 +2307,97 @@ directly reinforces the 2026-06-29 decision that closed-loop is the decisive met
    use policies competent enough to initiate motion (paper-scale-ish data). Otherwise both arms just deadlock and
    the comparison is uninformative. **A4 as-is is not a competent enough policy for closed-loop.**
 3. Then Phase 4 parallel-220 + Phase 5 metrics.
+
+### 2026-07-01 — open-loop at-rest probe CONFIRMS the capability gap (A4 λ2 stays put at rest); A3_2 v2-data configs staged
+
+**Ran the at-rest probe from the 2026-06-30 plan (step 1).** Built `local_data/b2d_80000/test_at_rest.jsonl`
+(`scripts/build_at_rest.py`): 2400 held-out at-rest samples = the b2d_80000 TEST scenes × frames {0,1,2},
+each a faithful cold start (history `(0,0)×4`, 4× black `hisblack.jpg` front frames, real surround, `<CoT_flag_False>`,
+GT = the route's real first-2 s motion). Inferred A4 λ2 (`1782584042_…`) open-loop and compared to its normal
+b2d_80000 TEST run.
+
+**Open-loop L2 — normal-driving vs at-rest (same checkpoint):**
+
+| set | n | 1 s L2 | 2 s L2 | avg |
+|---|---|---|---|---|
+| b2d_80000 TEST (mixed driving) | 4000 | 0.389 | 0.873 | **0.631** |
+| test_at_rest (frames 0/1/2, at rest) | 2400 | 0.738 | **2.943** | **1.841** |
+
+At rest the 2 s error **triples** (2.94 vs 0.87 m) and the average nearly triples (1.84 vs 0.63). The blow-up is
+almost entirely at the far horizon — exactly the signature of predicting ~no displacement while the car should
+already be accelerating.
+
+**Decisive per-sample read (parsed the raw waypoints in `debug/at_rest_A4.json`, 2 s displacement, STAY = <0.5 m):**
+- A4 predicts **STAY** on **98.5 %** of at-rest frames (mean predicted 2 s displacement = **0.12 m**).
+- GT is **GO** on **97.5 %** (mean GT 2 s displacement = **6.74 m**).
+- **Deadlock rate: on 96 % of all at-rest frames the GT accelerates but A4 emits ≈`(0,0)×4`** (98.5 % of go-frames).
+- Canonical example (record 0): GT `[(0.04,0),(1.12,0),(3.71,0),(7.39,0)]` (accelerating to 7.4 m) → A4 `[(0,0),(0,0),(0,0),(0,0)]`.
+
+**Conclusion — the 2026-06-30 hypothesis is confirmed: this is an at-rest CAPABILITY GAP, not a closed-loop bug.**
+On byte-faithful cold-start inputs the model stalls *open-loop too*, on held-out data, with the training flag
+(`<CoT_flag_False>`). Closed-loop merely **traps** it (feeds `(0,0)` back → stays at rest forever); the healthy
+open-loop average (0.63) **hides** it because moving frames dominate the mix and at-rest frames are a tiny minority.
+A4 (small strided b2d_80000 subset, red-light/yield waits dominate its at-rest examples) learned *"speed 0 ⇒ stay"*
+and can't discriminate the *"cold start ⇒ go"* case. The `CoT_flag` mismatch (agent hardcodes `True`) is a secondary
+aggravator, not the cause — the gap is already present here at `False`.
+
+**Fix staged (data, not a closed-loop tweak): the A3_2 arm on a rebalanced dataset.** Created 4 configs
+`configs/ad_bev_e2_4_A3_2_{lambda0,lambda2}_{seed0,seed1}.yaml` — identical recipe to A3 (warmstart, full-FT,
+frozen vision+DINOv3, plain MSE, lr 2e-5, 4 ep, eff-batch 64 ≈ 1248 steps) but pointed at a new dataset
+`local_data/b2d_40000_with_rest` (to build): 10000 `bench2drive_full` scenes × 4 frames = 40000, with a controlled
+mix that **forces** at-rest (start) and end-of-scenario frames — 10000 start + 10000 end + 20000 middle — so the
+model actually sees *"at rest ⇒ accelerate"* and *"approaching end ⇒ decelerate/stop"*. A3_2 also drops early stopping
+(trains the full 4 ep) and evals/saves every 250 steps. A3 configs switched to per-device batch 4 × accum 4 (same
+eff-batch 64) for throughput. **Next:** build `b2d_40000_with_rest`, retrain A3_2, re-run the at-rest probe to check
+the STAY-rate collapses, then closed-loop.
+
+### 2026-07-01 (cont.) — `b2d_40000_with_rest` BUILT (rest-rebalanced v2 data); A3_2 λ2 launched
+
+Built the dataset the A3_2 configs point at, and launched the arm. The realized design was **refined** from the
+staged plan above (which said 10000 start + 10000 end + 20000 middle): to keep **10000 *distinct* scenes** (max scene
+diversity — the lever that cured variance-check in A3/A4), each scene contributes **one** anchor, not two.
+
+**Dataset — `local_data/b2d_40000_with_rest` (new builder [scripts/build_b2d_with_rest.py](scripts/build_b2d_with_rest.py)).**
+- **TRAIN = 40000** = 10000 `bench2drive_full` scenes × 4 frames, partitioned into two random disjoint halves:
+  - **5000 START-anchored scenes** → 1 **literal at-rest cold start (frame 0)** + 3 interior frames.
+  - **5000 END-anchored scenes** → 1 **near-end frame** (uniform jitter in the last ~10 % of the usable range) + 3 interior.
+  - ⇒ realized anchor mix **start 5000 / end 5000 / spread (interior) 30000** (verified).
+- **Cold-start frame reuses [build_at_rest.py](scripts/build_at_rest.py)'s treatment exactly:** history trajectory
+  `(0,0)×4` (parse_anno `his_index<0` branch) + the 4 CAM_FRONT history images = black `hisblack.jpg` (pre-spawn
+  slots don't exist); the 6 surround + 5 future-BEV crops at frame 0 are **real** (verified present) so the world
+  loss `loss_gen` is still supervised. This is the *"at rest ⇒ accelerate"* signal A4 never saw.
+- **Builder** is a faithful extension of [build_b2d.py](scripts/build_b2d.py): identical sample core
+  (`tpg.parse_anno`/`get_prompt`/`get_answer`/15-image list, ~50-anno fast read, all-15 existence check, disjointness
+  asserts, registry) — only the frame selection (`_pick_frames` start/end/spread) and the `hf<0→HISBLACK` padding
+  differ. Adds an `_anchor` tag per row. Rows are byte-compatible with `build_b2d.py` output.
+- **EVAL/TEST = reused from `b2d_80000` verbatim** (1000 eval / 4000 test, interior-only) → held-out L2 stays
+  directly comparable to A3/A4/b2d_80000 runs. Safe because the whole TRAIN pool is `bench2drive_full` and
+  b2d_80000's eval/test are `bench2drive_base`, and `full ∩ base = ∅`.
+
+**Verification (post-build).**
+- **Zero overlap, every granularity** — train/eval/test pairwise intersection = **0** at scene-name, `(scene,frame)`,
+  and exact-content (messages + image-path list) levels; **no within-split duplicates** (40000/1000/4000 all unique).
+- **Cold starts confirmed present** — exactly **5000** `_anchor:"start"` rows, from **5000 distinct scenes, all frame 0**;
+  in aggregate **all 5000** have 4× black history images AND `(0,0)×4` history, all 15 images on disk.
+
+**Design rationale / caveats (recorded for the write-up).**
+- **Why 5000 cold starts is enough:** cold-start is an *absence* problem, not a diversity one — the input is highly
+  stereotyped (identical black history + identical zero trajectory + speed≈0); going 0→5000 is the decisive jump, and
+  5000 *distinct-scene* spawns supplies the route-conditioned "which way to go." At 1/8 of the set it is **~25×**
+  over-sampled vs the natural spawn frequency (~1/200 frames) → strong balance, won't be washed out.
+- **Two honest gaps:** (1) only the *literal* spawn (frame 0) is covered, **not the ramp-up** (frames 1–19, partially
+  black history) — if the closed-loop stall is the whole pull-away transient, a follow-up should add progressive-black
+  ramp frames; (2) the reused eval/test are **interior-only**, so they measure ordinary-driving L2 but are **blind to
+  the cold-start fix** — the actual capability must be re-measured with the at-rest probe.
+
+**Launched — A3_2 λ2 (world head ON)** on GPUs 0–3:
+`CUDA_VISIBLE_DEVICES=0,1,2,3 FORCE_TORCHRUN=1 scripts/train.sh configs/ad_bev_e2_4_A3_2_lambda2_seed0.yaml --test deepspeed=examples/deepspeed/ds_z2_config.json`
+(full-FT ZeRO-2, warmstart, frozen vision+DINOv3, plain MSE, lr 2e-5, 2 ep, eff-batch 64; `--test` auto-runs the
+held-out L2 + variance-check meter into the run dir).
+
+**Next:**
+1. Run the **λ0 control** (`ad_bev_e2_4_A3_2_lambda0_seed0.yaml`) → the world-ON-vs-OFF L2 ablation on identical data.
+2. **Re-run the at-rest probe** ([build_at_rest.py](scripts/build_at_rest.py) on the held-out scenes) against A3_2 —
+   the pass/fail signal is whether the **STAY-rate collapses** from A4's 98.5 % toward GT's ~2.5 %.
+3. If motion initiates, take A3_2 to **closed-loop** (the decisive metric) — matching the training `<CoT_flag_False>`
+   in the agent first.
